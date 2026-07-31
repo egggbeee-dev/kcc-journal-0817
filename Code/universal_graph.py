@@ -15,12 +15,14 @@ from __future__ import annotations
 import copy
 import re
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from config import FUZZY_STOPWORDS
 from models import ConflictEntry, ConflictType, LocalPlan, Offer, PlanStep
-from utils import format_joint_plan
+from utils import extract_json, format_joint_plan
+from vlm import run_vlm
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -58,34 +60,96 @@ def build_item_nodes(offers: Dict[str, Offer]) -> List[ItemNode]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 텍스트 매칭 (LLM 없음 — 정규화 후 완전 일치 또는 부분 포함)
+# MATCH 후보 생성 — 노드 센트릭 (각 NEED 노드가 "자기 몫만" 스스로 계산)
+#
+#   중앙 조정자가 전체 need+provide를 한 번에 모아서 계산하는 게 아니라,
+#   NEED 노드 하나하나가 독립적으로 "자기 need 텍스트 + 전체 provide 목록"을
+#   놓고 스스로 후보를 판단한다 (GraphAgent-Reasoner의 노드 센트릭 분해와 동일한
+#   원리). 계산 주체가 항상 "그 need를 가진 agent 자신"이므로 중앙집중이 아님.
+#   need 노드 수만큼 개별 호출(병렬) — 배치 1회로 전체를 계산하지 않음.
+#
+#   텍스트만 오가므로 저비용. run_vlm은 이미지 인자를 요구하는 인터페이스라서,
+#   그 need를 가진 agent 자신의 zone 이미지 1장을 "앵커"로 재사용한다(추론 자체는
+#   순수 텍스트 기반이며, 이미지 내용은 이 판단에 실제로 사용되지 않는다).
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())
 
 
-def _texts_match(need_text: str, provide_text: str) -> bool:
-    n, p = _norm_text(need_text), _norm_text(provide_text)
-    if not n or not p:
-        return False
-    if n == p:
-        return True
-    # 부분 포함: "flashlight" in "a flashlight from the drawer" 같은 케이스 커버
-    return n in p or p in n
+_MATCH_PROMPT_TEMPLATE = """You are {agent_id}. You stated this need: "{need_text}"
+
+Below is the full list of items other agents have offered to provide
+(you already know this — offers were broadcast to everyone):
+{candidates_str}
+
+Which of these items could satisfy your need? Consider substitutes and
+related items, not just literal word matches — for example, a "vegetable
+tray" could satisfy a need for "snacks", or a "flashlight" could satisfy
+a need described as "light source".
+
+Return ONLY valid JSON:
+<JSON>
+{{"candidates": [{{"item_id": "...", "reason": "one short phrase"}}]}}
+</JSON>
+If nothing plausibly fits, return {{"candidates": []}}."""
 
 
-def build_match_candidates(items: List[ItemNode]) -> Dict[str, List[str]]:
-    """need_item_id -> [provide_item_id, ...] (다른 owner_agent_id끼리만)"""
+def _build_match_prompt(agent_id: str, need_text: str, provide_items: List[ItemNode]) -> str:
+    candidates_str = "\n".join(
+        f'- item_id="{p.item_id}" (from {p.agent_id}): "{p.text}"' for p in provide_items
+    )
+    return _MATCH_PROMPT_TEMPLATE.format(
+        agent_id=agent_id, need_text=need_text, candidates_str=candidates_str,
+    )
+
+
+def _anchor_image(agent_id: str, agent_zone_images: Dict[str, List[str]]) -> List[str]:
+    """이 need-agent 자신의 zone 이미지 1장(없으면 다른 agent 것이라도)을 앵커로."""
+    imgs = agent_zone_images.get(agent_id) or []
+    if imgs:
+        return [imgs[0]]
+    for other_imgs in agent_zone_images.values():
+        if other_imgs:
+            return [other_imgs[0]]
+    return []
+
+
+def compute_match_candidates(
+    items: List[ItemNode],
+    agent_zone_images: Dict[str, List[str]],
+) -> Dict[str, List[str]]:
+    """
+    need_item_id -> [provide_item_id, ...]
+    각 NEED 노드가 독립적으로(병렬) 자기 몫만 계산. 노드 수만큼 개별 호출.
+    """
     needs = [it for it in items if it.kind == "NEED"]
     provides = [it for it in items if it.kind == "PROVIDE"]
+
+    def _one(need: ItemNode) -> Tuple[str, List[str]]:
+        others = [p for p in provides if p.agent_id != need.agent_id]
+        if not others:
+            return need.item_id, []
+        prompt = _build_match_prompt(need.agent_id, need.text, others)
+        anchor = _anchor_image(need.agent_id, agent_zone_images)
+        raw, _ = run_vlm(anchor, prompt)
+        data = extract_json(raw)
+        valid_ids = {p.item_id for p in others}
+        cand_ids: List[str] = []
+        if isinstance(data, dict):
+            for c in data.get("candidates", []):
+                if isinstance(c, dict) and c.get("item_id") in valid_ids:
+                    cand_ids.append(c["item_id"])
+        return need.item_id, cand_ids
+
     candidates: Dict[str, List[str]] = {}
-    for n in needs:
-        matched = [
-            p.item_id for p in provides
-            if p.agent_id != n.agent_id and _texts_match(n.text, p.text)
-        ]
-        candidates[n.item_id] = matched
+    if not needs:
+        return candidates
+    with ThreadPoolExecutor(max_workers=len(needs)) as ex:
+        futs = [ex.submit(_one, n) for n in needs]
+        for f in futs:
+            nid, cids = f.result()
+            candidates[nid] = cids
     return candidates
 
 
@@ -444,9 +508,19 @@ def run(
 ) -> dict:
     plans = copy.deepcopy(plans)  # 원본 보존
 
-    # ── 1) 매칭 ──────────────────────────────────────────────────────────────
+    # active_agents가 Agent 객체 리스트면 zone_images를 뽑아서 앵커 이미지로 사용.
+    # (하위호환: agent_id 문자열 리스트가 들어오면 zone_images 없이 진행 — 이 경우
+    #  텍스트-only 호출을 지원 안 하는 백엔드(Qwen)에서는 매칭이 실패할 수 있음)
+    agent_zone_images: Dict[str, List[str]] = {}
+    for a in active_agents:
+        aid = getattr(a, "agent_id", a)
+        imgs = getattr(a, "zone_images", None)
+        if imgs:
+            agent_zone_images[aid] = imgs
+
+    # ── 1) 매칭 (노드 센트릭: 각 NEED 노드가 자기 몫만 독립적으로 계산) ────────
     items = build_item_nodes(offers)
-    candidates = build_match_candidates(items)
+    candidates = compute_match_candidates(items, agent_zone_images)
     handoffs, unresolved_needs = resolve_matches(items, candidates, offers, room_adjacency)
 
     print(f"  [MATCH] {len(handoffs)}개 확정, {len(unresolved_needs)}개 미해결")
