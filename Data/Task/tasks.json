@@ -1,0 +1,490 @@
+[
+  {
+    "id": "task_001",
+    "description": "5 guests are coming in 30 minutes, so please clean and prepare the house starting from where the guests will stay the longest.",
+    "ground_truth": {
+      "kitchen": [
+        "Took out the food and placed it on the table",
+        "Took out 5 servings of cups and plates and placed them on the dining table",
+        "Washed and put away dirty dishes",
+        "Cleaned the table",
+        "Checked inside the microwave and closed the door"
+      ],
+      "living room": [
+        "Arranged the cushions on the sofa to secure seating",
+        "Cleaned the floor",
+        "Cleared the table",
+        "Turned on the light switch to brighten the room"
+      ],
+      "bathroom": [
+        "Hung toilet paper on the holder",
+        "Cleaned the smudges on the mirror",
+        "Emptied the trash can",
+        "Cleaned around the sink",
+        "Closed the toilet lid"
+      ],
+      "bedroom": [
+        "Neatly arranged the items on top of the dresser",
+        "Organized the items on the bed",
+        "Turned on the light switch to brighten the room",
+        "Neatly arranged the items on the desk",
+        "Cleaned up the items on the floor"
+      ]
+    }
+  },
+  {
+    "id": "task_002",
+    "description": "A power outage is expected soon. Secure electronic devices in each room and take necessary measures within 15 minutes.",
+    "ground_truth": {
+      "kitchen": [
+        "Opened the refrigerator door to check the food inside and its preservation status",
+        "Closed the refrigerator door again to preserve the cold air",
+        "Secured water",
+        "Turned off the coffee machine"
+      ],
+      "living room": [
+        "Grabbed the electronic devices",
+        "Turned off the light switch",
+        "Closed the curtains to block the outside",
+        "Turned off the television",
+        "Turned off the floor lamp switch"
+      ],
+      "bedroom": [
+        "Checked the charging status of the electronic devices and gathered them",
+        "Turned off the light switch",
+        "Found the laptop and checked its battery status",
+        "Turned off the lamp"
+      ],
+      "bathroom": [
+        "Turned off the bathroom light switch",
+        "Drew a little emergency water in the sink",
+        "Filled the bathtub with emergency water",
+        "Closed the window, if any, to block external factors"
+      ]
+    }
+  },
+  {
+    "id": "task_003",
+    "description": "Someone is feeling cold. Block the cold air from the windows and prepare a place to sit.",
+    "ground_truth": {
+      "living room": [
+        "Closed the curtains to block the cold air from the window",
+        "Arranged the cushions on the sofa to make a place to sit",
+        "Placed a warm blanket on the sofa",
+        "Checked the status of the heater",
+        "Cleared the table to place warm drinks"
+      ],
+      "bedroom": [
+        "Closed the blinds to reduce drafts",
+        "Tidied up the items on the bed",
+        "Took out an extra thick comforter and placed it on the bed",
+        "Closed the dresser drawers"
+      ],
+      "kitchen": [
+        "Closed the window, if any, to block the cold wind in the kitchen",
+        "Warmed a cup of water using the microwave",
+        "Checked if the area around the gas stove was safe",
+        "Pulled the dining chairs inward",
+        "Turned on the coffee machine to get ready to prepare warm coffee"
+      ],
+      "bathroom": [
+        "Closed the bathroom window, if any",
+        "Drew a little warm water in the bathtub in advance",
+        "Placed a towel within easy reach",
+        "Turned the sink faucet to the hot water side",
+        "Closed the bathroom door to keep the cold air out"
+      ]
+    }
+  },
+  {
+    "id": "task_004",
+    "description": "There's a strange smell in the house. Check each room, find the most likely source, and take action.",
+    "ground_truth": {
+      "kitchen": [
+        "Checked inside the trash can",
+        "Opened the refrigerator to check for spoiled food",
+        "Checked around the sink drain",
+        "Checked for a burning smell inside the microwave",
+        "Checked the pots or frying pans on the gas stove"
+      ],
+      "bathroom": [
+        "Checked the sink and bathtub drains",
+        "Checked the condition of the toilet",
+        "Checked the trash can",
+        "Checked if the towels on the towel rack smelled sour",
+        "Opened the cabinet to check for mold inside"
+      ],
+      "living room": [
+        "Checked the sofa surface for stains",
+        "Cleaned the table",
+        "Checked for food waste dropped under the table",
+        "Opened the window, if any, to ventilate the living room",
+        "Lifted the sofa cushions and checked underneath"
+      ],
+      "bedroom": [
+        "Checked the trash can",
+        "Looked for hidden stains or dirt under the bed",
+        "Opened the dresser to check if it was the source of the smell",
+        "Opened the room door to help ventilate"
+      ]
+    }
+  },
+  {
+    "id": "task_005",
+    "description": "I'm trying to save on electricity bills. Find and turn off the electronic devices that are left on in each room.",
+    "ground_truth": {
+      "living room": [
+        "Turned off the floor lamp",
+        "Turned off the television",
+        "Turned off unused light switches",
+        "Checked if the air conditioner or fan was turned off",
+        "Opened the curtains to let natural light in, replacing artificial lighting"
+      ],
+      "kitchen": [
+        "Turned off the coffee machine",
+        "Checked if the microwave was turned off",
+        "Turned off the light switch",
+        "Checked if any electrical appliances were unplugged",
+        "Checked if the refrigerator door was closed tightly so cold air wouldn't leak"
+      ],
+      "bedroom": [
+        "Turned off the desk lamp",
+        "Checked the laptop's power status",
+        "Turned off the light switch",
+        "Checked if the charger was disconnected from the outlet"
+      ],
+      "bathroom": [
+        "Turned off the bathroom lights",
+        "Turned off the exhaust fan switch if it was on",
+        "Unplugged unnecessary plugs, like the electric toothbrush charger",
+        "Opened the window blinds to let in natural light"
+      ]
+    }
+  },
+  {
+    "id": "task_006",
+    "description": "Today is the proposal day. The partner thinks it's a normal evening. Prepare the living room and kitchen without them noticing.",
+    "ground_truth": {
+      "living room": [
+        "Adjusted the lighting",
+        "Set plates on the table",
+        "Closed the curtains so it wouldn't be visible from outside",
+        "Neatly arranged the sofa cushions to make it cozy",
+        "Turned off the television to create a quiet atmosphere"
+      ],
+      "kitchen": [
+        "Took out the prepared drinks from the refrigerator",
+        "Set the plates on the table",
+        "Tidied the table so the partner wouldn't notice",
+        "Cleaned the floor neatly",
+        "Decorated the dining table with food"
+      ],
+      "bedroom": [
+        "Hid a small box inside the drawer and closed it",
+        "Took out clothes in advance to prepare",
+        "Neatly made the bed and turned on the mood lighting",
+        "Picked up all the items dropped on the floor and put them in the dresser",
+        "Lowered the window blinds to ensure privacy"
+      ],
+      "bathroom": [
+        "Wiped the mirror clean",
+        "Hung hotel-style folded towels on the towel rack",
+        "Put clutter around the sink into the cabinet",
+        "Closed the toilet lid and placed a diffuser",
+        "Turned on the bathroom lights dimly"
+      ]
+    }
+  },
+  {
+    "id": "task_007",
+    "description": "I brought in 5 more potted plants. Choose locations throughout the house that do not block sunlight and traffic, and place them.",
+    "ground_truth": {
+      "living room": [
+        "Placed two potted plants on the table",
+        "Watered the potted plants",
+        "Pushed the potted plants to the corner next to the sofa so as not to obstruct traffic",
+        "Adjusted the curtains so direct sunlight hits the potted plants",
+        "Picked up and threw away fallen dirt and leaves"
+      ],
+      "kitchen": [
+        "Placed one potted plant near the window",
+        "Watered the potted plant",
+        "Checked if the potted plant was safe from the heat",
+        "Drew water in a cup at the sink and placed it next to the potted plant",
+        "Placed a potted plant in the corner of the table"
+      ],
+      "bedroom": [
+        "Placed one potted plant on the desk",
+        "Watered the potted plant",
+        "Placed the potted plant in the corner so it wouldn't get in the way near the foot of the bed",
+        "Checked if the potted plant placed on the dresser was stable",
+        "Opened the room curtains to let the plant get sunlight"
+      ],
+      "bathroom": [
+        "Placed one potted plant on the counter next to the sink",
+        "Watered the potted plant",
+        "Checked if the plant likes moisture and placed it near the bathtub",
+        "Placed a small potted plant on the shelf above the toilet",
+        "Checked the saucer to ensure water wouldn't flow out from the bottom of the pot"
+      ]
+    }
+  },
+  {
+    "id": "task_008",
+    "description": "I am going to bathe the child. Check the bathroom for safety and gather necessary items from other rooms.",
+    "ground_truth": {
+      "bathroom": [
+        "Checked the condition of the water in the bathtub",
+        "Checked that the mirror was not broken",
+        "Moved dangerous items into the cupboard",
+        "Hung a towel on the towel rack",
+        "Moved the soap to the edge of the sink where it is easy to reach"
+      ],
+      "bedroom": [
+        "Took out clothes to change into from the dresser",
+        "Moved the clothes to the bathroom",
+        "Laid a large towel on the bed for the child to lie on after washing",
+        "Secured the room door so it wouldn't close",
+        "Closed all dresser drawers to prevent injury"
+      ],
+      "kitchen": [
+        "Prepared water to drink after the bath",
+        "Prepared a bowl for snacks",
+        "Poured a warm drink into a cup and heated it in the microwave",
+        "Moved the dining chairs so the child wouldn't bump into them",
+        "Checked the sink for dangerous items and cleared them"
+      ],
+      "living room": [
+        "Cleaned the floor",
+        "Took measures to prevent bumping into the table corners",
+        "Placed a spare set of clothes on the sofa to wear after washing",
+        "Closed the window, if any, to raise the indoor temperature",
+        "Turned off the television so the child could focus on the bath"
+      ]
+    }
+  },
+  {
+    "id": "task_009",
+    "description": "Everyone is sleeping, but I need to go to the bathroom. Check the route so I can go as quietly as possible.",
+    "ground_truth": {
+      "bedroom": [
+        "Checked the location of objects in the path",
+        "Checked that there was nothing on the floor when getting out of bed",
+        "Opened the room door slowly so it wouldn't creak",
+        "Dimmed the lights"
+      ],
+      "living room": [
+        "Checked the location of items to identify obstacles",
+        "Checked the television's standby status",
+        "Moved quietly by leaning on the sofa to gauge the direction",
+        "Took a wide detour to avoid bumping into the table in the dark"
+      ],
+      "bathroom": [
+        "Used the faucet while being careful of the noise",
+        "Used minimal lighting",
+        "Closed the toilet lid soundlessly",
+        "Pressed the flush button gently",
+        "Reduced noise by not closing the door completely"
+      ],
+      "kitchen": [
+        "Checked if tables or chairs were blocking the path",
+        "Checked if any other devices were operating besides the refrigerator noise",
+        "Checked underfoot for fallen forks or plates",
+        "Checked the location of items to identify obstacles"
+      ]
+    }
+  },
+  {
+    "id": "task_010",
+    "description": "An earthquake just happened. Go through each room, check for hazards, and prepare to evacuate.",
+    "ground_truth": {
+      "kitchen": [
+        "Checked if the gas stove or gas fire was turned off",
+        "Checked if there were any broken dishes",
+        "Checked for damage to the refrigerator",
+        "Checked if cupboard doors were open and objects might spill out",
+        "Checked that knives or sharp tools hadn't fallen out of the sink"
+      ],
+      "living room": [
+        "Checked if there were any broken items",
+        "Checked if the table had fallen over",
+        "Checked if any items had dropped",
+        "Checked if the television was secured and hadn't tipped over",
+        "Inspected the window glass for cracks"
+      ],
+      "bedroom": [
+        "Checked if any items had fallen from the dresser",
+        "Secured electronic devices",
+        "Checked for lamps or books that might fall onto the bed",
+        "Checked if dresser drawers had opened due to the earthquake vibrations and closed them",
+        "Kept the room door open to ensure the evacuation route was not blocked"
+      ],
+      "bathroom": [
+        "Checked for damage to the mirror",
+        "Checked for water leaks from the sink or bathtub",
+        "Filled the bathtub with water",
+        "Checked that the toilet water tank lid hadn't shifted",
+        "Inspected the shower booth or bathtub tiles for cracks"
+      ]
+    }
+  },
+  {
+    "id": "task_011",
+    "description": "I am moving next week. Please pack the belongings in each room into boxes.",
+    "ground_truth": {
+      "living room": [
+        "Packed items into the box",
+        "Packed the television into a box",
+        "Closed and organized the boxes",
+        "Packed the cushions and blankets from the sofa into a box",
+        "Removed fragile items and wrapped them in bubble wrap (cushioning material)"
+      ],
+      "kitchen": [
+        "Carefully packed dishes into a box",
+        "Safely packed sharp objects",
+        "Emptied the trash can",
+        "Took out cooking utensils and packed them in a large box",
+        "Gathered leftover groceries from the cupboard or refrigerator into a box"
+      ],
+      "bedroom": [
+        "Cleaned the floor",
+        "Emptied the dresser",
+        "Removed the bed covers and blankets and put them in a vacuum seal bag",
+        "Opened the desk drawers and packed the items into a box"
+      ],
+      "bathroom": [
+        "Packed towels into a box",
+        "Emptied the cupboard",
+        "Put items on the sink into ziplock bags",
+        "Packed items from the mirrored cabinet into a box",
+        "Gathered cleaning tools and put them in a plastic bag"
+      ]
+    }
+  },
+  {
+    "id": "task_012",
+    "description": "Heavy rain is expected tonight. Prepare each room in advance for potential flooding and power outages.",
+    "ground_truth": {
+      "living room": [
+        "Closed the window, if any",
+        "Moved items on the table to a higher place",
+        "Unplugged the television's power cord from the outlet",
+        "Prepared towels"
+      ],
+      "kitchen": [
+        "Checked if the faucets were turned off",
+        "Checked that the sink wouldn't overflow",
+        "Secured water bottles in advance",
+        "Moved items from the floor onto the dining table",
+        "Unplugged unnecessary kitchen appliances other than the refrigerator"
+      ],
+      "bathroom": [
+        "Checked that the bathtub or sink wouldn't overflow",
+        "Checked the lock status of the faucets",
+        "Checked the floor drain for debris to ensure smooth water drainage",
+        "Put items like the hair dryer into the cupboard",
+        "Checked the lock to make sure the window, if any, was tightly closed"
+      ],
+      "bedroom": [
+        "Secured electronic devices",
+        "Moved any items on the floor around the bed to a high place and secured them",
+        "Checked if the window, if any, was leaking water",
+        "Moved important items from the lower drawers to the upper drawers"
+      ]
+    }
+  },
+  {
+    "id": "task_013",
+    "description": "I have a flight tomorrow morning. Gather the luggage from each room to pack in the suitcase.",
+    "ground_truth": {
+      "bedroom": [
+        "Packed clothes into the box",
+        "Packed the laptop into the box",
+        "Laid out tomorrow's clothes on the bed in advance",
+        "Checked if all dresser drawers were properly closed"
+      ],
+      "bathroom": [
+        "Gathered toiletries and moved them to the suitcase",
+        "Gathered and moved towels",
+        "Packed skin lotion in a ziplock bag",
+        "Emptied the bathroom trash can in advance"
+      ],
+      "living room": [
+        "Cleaned the table",
+        "Organized the cushions on the sofa",
+        "Turned off the television and tidied up",
+        "Turned off the living room lights"
+      ],
+      "kitchen": [
+        "Grabbed a water bottle and moved it to the suitcase",
+        "Packed some simple snacks to eat on the plane",
+        "Disposed of food with a short shelf life in the refrigerator",
+        "Checked if the gas stove valve was closed",
+        "Checked if anything was left behind on the dining table"
+      ]
+    }
+  },
+  {
+    "id": "task_014",
+    "description": "I am leaving the house for 2 weeks. Organize each room before I leave.",
+    "ground_truth": {
+      "kitchen": [
+        "Checked for spoiled food in the refrigerator",
+        "Checked if the gas stove controls were turned off",
+        "Cleaned out any food in the sink drain",
+        "Tidied up the table"
+      ],
+      "living room": [
+        "Turned off the lights",
+        "Cleaned up any food if there was any",
+        "Turned off the television",
+        "Tidied up the sofa"
+      ],
+      "bedroom": [
+        "Turned off the lights",
+        "Checked the power status of electronic devices",
+        "Covered the bed nicely with a blanket to keep dust off",
+        "Double-checked if the dresser drawers were properly closed"
+      ],
+      "bathroom": [
+        "Checked if the faucets were turned off",
+        "Closed the cupboard",
+        "Completely wiped dry the sink and bathtub to prevent mold",
+        "Closed the toilet lid",
+        "Turned off the bathroom exhaust fan and left the door slightly open to ventilate"
+      ]
+    }
+  },
+  {
+    "id": "task_015",
+    "description": "I tested positive for COVID-19 and need to quarantine in my room. Prepare for quarantine and take care of me.",
+    "ground_truth": {
+      "bedroom": [
+        "Replaced the bedding with fresh ones",
+        "Set aside bowls and cups exclusively for the quarantine room",
+        "Cleaned thoroughly to keep it sanitary",
+        "Set up a laptop or books on the desk to create a work environment",
+        "Opened the window, if any, for ventilation"
+      ],
+      "kitchen": [
+        "Prepared bowls or cups separately",
+        "Tidied up the table as if disinfecting it",
+        "Cleaned thoroughly to keep it sanitary",
+        "Wiped the table clean to disinfect it"
+      ],
+      "living room": [
+        "Placed a bowl on the table to use as a contactless drop-off point",
+        "Wiped items clean",
+        "Opened the window, if any, to ventilate common areas like the sofa",
+        "Cleaned the floor thoroughly"
+      ],
+      "bathroom": [
+        "Kept toiletries separate, exclusively for the quarantined person",
+        "Kept towels separately",
+        "Placed disinfectant next to the toilet to spray after use",
+        "Wiped around the sink and placed a separate soap exclusively for the quarantined person",
+        "Kept the exhaust fan running continuously to let the air out"
+      ]
+    }
+  }
+]
