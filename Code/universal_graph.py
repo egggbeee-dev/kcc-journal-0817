@@ -611,7 +611,17 @@ def resolve_conflict(conflict: ConflictEntry, plans: Dict[str, LocalPlan]) -> Se
 # Kahn's Algorithm — 사이클 체크 + 위상 정렬 (cross-agent depends_on도 그대로 지원)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def kahn_topological_order(plans: Dict[str, LocalPlan]) -> Tuple[List[int], bool]:
+def kahn_topological_order(plans: Dict[str, LocalPlan]) -> Tuple[List[int], bool, List[Tuple[int, int]]]:
+    """
+    위상 정렬 + 사이클 자동 해소.
+    사이클이 감지되면(더 이상 in-degree=0 노드가 없는데 남은 스텝이 있으면),
+    남은 것 중 time_min이 가장 이른 스텝을 골라 그 스텝으로 들어오는 depends_on
+    엣지 하나를 끊는다 — cross-agent 엣지(STATE_DEPENDENCY 추론으로 생긴 것)를
+    우선 끊는다. 같은 agent 안 엣지는 원래 Local Plan에서 LLM이 명시한 의도라서
+    더 신뢰할 수 있고, cross-agent 엣지는 그래프 리즈닝이 사후에 추론한 것이라
+    끊어도 상대적으로 안전함.
+    반환: (정렬된 step_id 리스트, 사이클 없었는지 여부, 끊긴 엣지 리스트[(from,to)])
+    """
     all_steps = {s.step_id: s for p in plans.values() for s in p.steps}
     in_degree = {sid: 0 for sid in all_steps}
     adj: Dict[int, List[int]] = {sid: [] for sid in all_steps}
@@ -622,31 +632,68 @@ def kahn_topological_order(plans: Dict[str, LocalPlan]) -> Tuple[List[int], bool
                 adj[dep].append(sid)
                 in_degree[sid] += 1
 
-    queue = deque(sorted(sid for sid, d in in_degree.items() if d == 0))
     order: List[int] = []
-    while queue:
-        queue = deque(sorted(queue, key=lambda sid: all_steps[sid].time_min))
-        sid = queue.popleft()
-        order.append(sid)
-        for nxt in adj[sid]:
-            in_degree[nxt] -= 1
-            if in_degree[nxt] == 0:
-                queue.append(nxt)
+    remaining: Set[int] = set(all_steps.keys())
+    broken_edges: List[Tuple[int, int]] = []
+    queue = deque(sorted(sid for sid, d in in_degree.items() if d == 0))
 
-    no_cycle = len(order) == len(all_steps)
-    if not no_cycle:
-        remaining = [sid for sid in all_steps if sid not in order]
-        remaining.sort(key=lambda sid: all_steps[sid].time_min)
-        order.extend(remaining)
+    while remaining:
+        while queue:
+            queue = deque(sorted(queue, key=lambda sid: all_steps[sid].time_min))
+            sid = queue.popleft()
+            if sid not in remaining:
+                continue
+            order.append(sid)
+            remaining.discard(sid)
+            for nxt in adj[sid]:
+                if nxt in remaining:
+                    in_degree[nxt] -= 1
+                    if in_degree[nxt] == 0:
+                        queue.append(nxt)
 
-    return order, no_cycle
+        if not remaining:
+            break
+
+        # 사이클 발생 — 남은 것 중 time_min이 가장 이른 스텝을 강제로 진입시킴
+        stuck_id = min(remaining, key=lambda sid: all_steps[sid].time_min)
+        stuck_step = all_steps[stuck_id]
+        deps_in_remaining = [d for d in stuck_step.depends_on if d in remaining]
+
+        if not deps_in_remaining:
+            in_degree[stuck_id] = 0
+            queue.append(stuck_id)
+            continue
+
+        cross = [d for d in deps_in_remaining if all_steps[d].agent_id != stuck_step.agent_id]
+        to_break = cross[0] if cross else deps_in_remaining[0]
+        stuck_step.depends_on = [d for d in stuck_step.depends_on if d != to_break]
+        broken_edges.append((to_break, stuck_id))
+        in_degree[stuck_id] -= 1
+        if in_degree[stuck_id] == 0:
+            queue.append(stuck_id)
+
+    no_cycle = len(broken_edges) == 0
+    return order, no_cycle, broken_edges
 
 
-def merge_joint_plan(plans: Dict[str, LocalPlan]) -> List[dict]:
-    order, _ = kahn_topological_order(plans)
+def merge_joint_plan(plans: Dict[str, LocalPlan]) -> Tuple[List[dict], List[Tuple[int, int]]]:
+    order, no_cycle, broken_edges = kahn_topological_order(plans)
     all_steps = {s.step_id: s for p in plans.values() for s in p.steps}
+
+    if broken_edges:
+        print(f"  [MERGE] 사이클 감지 → {len(broken_edges)}개 cross-agent 엣지 자동 해제: {broken_edges}")
+
+    # 사이클 해제 후에도 depends_on 기준으로 시간이 여전히 모순될 수 있어서,
+    # 최종 위상순을 따라가며 "의존 대상보다 반드시 뒤에 오도록" 한 번 더 정합성 보정
+    for sid in order:
+        s = all_steps[sid]
+        for dep in s.depends_on:
+            dep_step = all_steps.get(dep)
+            if dep_step is not None and s.time_min <= dep_step.time_min:
+                s.time_min = dep_step.time_min + 1
+
     ordered_steps = [all_steps[sid] for sid in order]
-    return [
+    joint_plan = [
         {
             "step_id": s.step_id, "time_min": s.time_min, "room": s.room,
             "agent_id": s.agent_id, "action": s.action, "depends_on": s.depends_on,
@@ -655,6 +702,7 @@ def merge_joint_plan(plans: Dict[str, LocalPlan]) -> List[dict]:
         }
         for s in ordered_steps
     ]
+    return joint_plan, broken_edges
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -712,7 +760,7 @@ def run(
     print(f"  [CONFLICT] {len(resolved)}개 자동 해결, {len(handoff_conflicts)}개 미해결(DEPENDENCY)")
 
     # ── 3) Merge (Kahn's algorithm) ───────────────────────────────────────────
-    joint_plan = merge_joint_plan(plans)
+    joint_plan, broken_cycle_edges = merge_joint_plan(plans)
 
     return {
         "updated_plans": plans,
@@ -722,6 +770,7 @@ def run(
             ConflictEntry(ConflictType.DEPENDENCY, [], [], f"unmatched need item: {nid}", "no target found")
             for nid in unresolved_needs
         ],
+        "broken_cycle_edges": broken_cycle_edges,
         "joint_plan": joint_plan,
         "joint_plan_text": format_joint_plan(joint_plan),
     }
