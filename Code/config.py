@@ -29,7 +29,7 @@ NON_PASSABLE_KW = {
 }
 
 FUZZY_STOPWORDS = {
-    "the", "a", "an", "and", "or", "with", "on", "in", "at", "to",
+    "the", "a", "an", "and", "or", "with", "on", "in", "at", "to", "of",
     "set", "up", "get", "put", "make", "do", "move", "check", "use",
     "take", "open", "close", "place", "arrange", "clean",
 }
