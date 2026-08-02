@@ -407,7 +407,7 @@ def apply_handoff(
             room=need_plan.steps[0].room if need_plan.steps else "",
             agent_id=a.need_agent,
             action=f"receive {clean_item}",
-            depends_on=[],
+            depends_on=[send_step.step_id],  # 보내는 스텝보다 반드시 뒤에 오도록 강제
             handoff_type=None,
             target_agent=None,
             uncertainty=0.2,
@@ -416,6 +416,14 @@ def apply_handoff(
         need_plan.steps.append(recv_step)
         need_plan.steps.sort(key=lambda s: (s.time_min, s.step_id))
         affected.add(new_id)
+
+    # recv_step이 새로 만들어졌든(위에서 depends_on 지정) LLM이 이미 만들어뒀던 것이든,
+    # 반드시 send_step보다 뒤에 오도록 의존성을 강제한다 (여기서 한 번 더 보장).
+    if send_step.step_id not in recv_step.depends_on:
+        recv_step.depends_on = list(recv_step.depends_on) + [send_step.step_id]
+        affected.add(recv_step.step_id)
+    if recv_step.time_min <= send_step.time_min:
+        _propagate_time_forward(plans, recv_step.step_id, send_step.time_min + 2, affected)
 
     # 이 아이템을 실제로 쓰는 다른 스텝이 받기 전에 와 있으면 순서 재조정
     # (그 스텝에 의존하는 후속 스텝들까지 연쇄적으로 전파)
@@ -718,9 +726,26 @@ def run(
     max_rounds: int = 10,
 ) -> dict:
     plans = copy.deepcopy(plans)
+    events: List[dict] = []  # 데모/시각화용 구조화된 이벤트 로그 (실제 실행 데이터)
+
+    agent_ids = [getattr(a, "agent_id", a) for a in active_agents]
+    for aid in agent_ids:
+        events.append({"type": "node", "kind": "agent", "id": aid})
 
     # ── 1) 매칭 (그래프 + Hungarian Algorithm) ────────────────────────────────
     items = build_item_nodes(offers)
+    for it in items:
+        events.append({
+            "type": "node", "kind": "item", "id": it.item_id, "agent": it.agent_id,
+            "item_kind": it.kind, "text": it.text,
+        })
+    for p in plans.values():
+        for s in p.steps:
+            events.append({
+                "type": "node", "kind": "step", "id": f"step_{s.step_id}",
+                "agent": s.agent_id, "text": s.action,
+            })
+
     assignments, unresolved_needs = compute_match_assignments(items, plans, offers, room_adjacency)
 
     print(f"  [MATCH] {len(assignments)}개 확정 "
@@ -729,16 +754,28 @@ def run(
           f"{len(unresolved_needs)}개 미해결")
     handoff_conflicts: List[ConflictEntry] = []
     for a in assignments:
-        tag = "선언됨" if a.source_step_id is not None else f"sim={a.weight:.2f}"
+        declared = a.source_step_id is not None
+        tag = "선언됨" if declared else f"sim={a.weight:.2f}"
         if a.target_kind == "PROVIDE":
             print(f"    [HANDOFF] {a.target_agent} → {a.need_agent} : {a.target_text} ({tag})")
             conflict, _ = apply_handoff(a, plans)
+            events.append({
+                "type": "edge", "kind": "handoff", "from": a.target_agent, "to": a.need_agent,
+                "label": a.target_text, "weight": a.weight, "declared": declared,
+            })
             if conflict:
                 handoff_conflicts.append(conflict)
         else:
             print(f"    [STATE_DEP] {a.need_agent} needs state from {a.target_agent}'s "
                   f"step '{a.target_text}' ({tag})")
             apply_state_dependency(a, plans)
+            events.append({
+                "type": "edge", "kind": "state_dependency",
+                "from": f"step_{a.target_id}", "to": a.need_agent,
+                "label": a.target_text, "weight": a.weight, "declared": declared,
+            })
+    for nid in unresolved_needs:
+        events.append({"type": "unresolved_need", "id": nid})
 
     # ── 2) SAME_ROOM 엣지 구축 + Conflict 워크리스트 (엣지 순회) ───────────────
     same_room_edges = build_same_room_edges(plans)
@@ -750,6 +787,10 @@ def run(
         c = conflict_queue.popleft()
         affected = resolve_conflict(c, plans)
         resolved.append(c)
+        events.append({
+            "type": "conflict_resolved", "conflict_type": c.conflict_type,
+            "step_ids": c.step_ids, "description": c.description,
+        })
         if affected:
             same_room_edges = build_same_room_edges(plans)  # 스텝 변경 반영해 재구축
             new_conflicts = detect_conflicts_via_edges(plans, offers, same_room_edges, only_step_ids=affected)
@@ -761,6 +802,12 @@ def run(
 
     # ── 3) Merge (Kahn's algorithm) ───────────────────────────────────────────
     joint_plan, broken_cycle_edges = merge_joint_plan(plans)
+    for from_id, to_id in broken_cycle_edges:
+        events.append({"type": "cycle_broken", "from": f"step_{from_id}", "to": f"step_{to_id}"})
+    events.append({
+        "type": "final_order",
+        "order": [s["step_id"] for s in joint_plan],
+    })
 
     return {
         "updated_plans": plans,
@@ -773,4 +820,5 @@ def run(
         "broken_cycle_edges": broken_cycle_edges,
         "joint_plan": joint_plan,
         "joint_plan_text": format_joint_plan(joint_plan),
+        "graph_events": events,  # 데모/시각화(graph_demo.py)에서 그대로 사용
     }
