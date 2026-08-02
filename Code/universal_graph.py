@@ -138,6 +138,7 @@ class MatchAssignment:
     target_agent:  str
     target_text:   str
     weight:        float
+    source_step_id: Optional[int] = None  # 선언된 handoff면 정확한 send step_id
 
 
 def build_item_nodes(offers: Dict[str, Offer]) -> List[ItemNode]:
@@ -177,6 +178,39 @@ def room_distance(
     return 1
 
 
+def apply_declared_handoffs(
+    plans: Dict[str, LocalPlan],
+) -> List[MatchAssignment]:
+    """
+    1단계 — Local Plan 생성 단계에서 LLM이 이미 명시적으로 정한 PASS 타겟
+    (handoff_type="PASS" + target_agent 확정)을 그래프 매칭보다 먼저 신뢰한다.
+    이걸 무시하고 임베딩 매칭을 처음부터 다시 돌리면, 이미 정해진 의도를
+    엉뚱한 agent한테 재배정해버리는 문제가 생길 수 있음 (실측으로 확인됨).
+    """
+    declared: List[MatchAssignment] = []
+    for agent_id, plan in plans.items():
+        for s in plan.steps:
+            if s.handoff_type == "PASS" and s.target_agent and s.target_agent in plans:
+                item_text = s.action
+                declared.append(MatchAssignment(
+                    need_item_id=f"__declared__{s.step_id}",
+                    need_agent=s.target_agent,
+                    need_text=item_text,
+                    target_kind="PROVIDE",
+                    target_id=f"__declared__{s.step_id}",
+                    target_agent=agent_id,
+                    target_text=item_text,
+                    weight=1.0,  # 로컬 플랜에서 이미 확정된 것이므로 최고 신뢰도
+                    source_step_id=s.step_id,
+                ))
+    return declared
+
+
+def _already_declared_agent_pairs(declared: List[MatchAssignment]) -> Set[Tuple[str, str]]:
+    """이미 선언된 (provide_agent, need_agent) 쌍 — Hungarian 대상에서 제외용."""
+    return {(a.target_agent, a.need_agent) for a in declared}
+
+
 def compute_match_assignments(
     items: List[ItemNode],
     plans: Dict[str, LocalPlan],
@@ -186,17 +220,23 @@ def compute_match_assignments(
     """
     NEED × (PROVIDE 아이템 ∪ 다른 agent의 Step) 가중치 그래프를 만들고,
     Hungarian Algorithm으로 전역 최적 1:1 배정을 계산한다.
-    반환: (확정된 MatchAssignment 리스트, 매칭 안 된 need_item_id 리스트)
+
+    단, Local Plan에서 이미 명시적으로 확정된 PASS(target_agent 포함)는
+    1단계(apply_declared_handoffs)에서 먼저 신뢰하고, 그 agent 쌍은
+    Hungarian 매칭 대상에서 제외한다 (이미 정해진 걸 재배정하지 않도록).
+
+    반환: (확정된 MatchAssignment 리스트 — 선언분+Hungarian분, 매칭 안 된 need_item_id 리스트)
     """
+    declared = apply_declared_handoffs(plans)
+    declared_pairs = _already_declared_agent_pairs(declared)
+
     needs = [it for it in items if it.kind == "NEED"]
     provides = [it for it in items if it.kind == "PROVIDE"]
     all_steps = [s for p in plans.values() for s in p.steps]
 
     if not needs:
-        return [], []
+        return declared, []
 
-    # 타겟 후보: PROVIDE 아이템 + 모든 Step (핸드오프성 스텝까지 포함 — 상태
-    # 요구가 다른 agent의 어떤 행동으로도 충족될 수 있으므로 전체 다 후보)
     targets: List[Tuple[str, str, str, str]] = []  # (kind, id, agent_id, text)
     for p in provides:
         targets.append(("PROVIDE", p.item_id, p.agent_id, p.text))
@@ -204,39 +244,43 @@ def compute_match_assignments(
         targets.append(("STEP", str(s.step_id), s.agent_id, s.action))
 
     if not targets:
-        return [], [n.item_id for n in needs]
+        return declared, [n.item_id for n in needs]
 
     need_texts = [n.text for n in needs]
     target_texts = [t[3] for t in targets]
-    combined_vecs = embed_texts(need_texts + target_texts)  # 한 번에 묶어서 벡터화
+    combined_vecs = embed_texts(need_texts + target_texts)
     need_vecs = combined_vecs[: len(need_texts)]
     target_vecs = combined_vecs[len(need_texts):]
-    sim = cosine_sim_matrix(need_vecs, target_vecs)  # (n_needs, n_targets)
+    sim = cosine_sim_matrix(need_vecs, target_vecs)
 
-    # 비용 행렬: urgency 가중 + room 거리 페널티를 반영한 "점수"를 비용으로 변환
     cost = np.full(sim.shape, 1e6)
     for i, n in enumerate(needs):
         need_room = offers[n.agent_id].room_type
         for j, (tkind, tid, tagent, ttext) in enumerate(targets):
             if tagent == n.agent_id:
                 continue  # 자기 자신은 매칭 대상 아님
+            if (tagent, n.agent_id) in declared_pairs:
+                continue  # 이미 로컬 플랜에서 이 쌍끼리 확정됨 — Hungarian이 건드리지 않음
             urgency_w = n.urgency / 5.0
             dist_pen = room_distance(need_room, offers[tagent].room_type if tagent in offers else "",
                                       room_adjacency) * ROOM_DIST_PENALTY
             score = sim[i, j] * urgency_w - dist_pen
-            cost[i, j] = -score  # Hungarian은 최소화이므로 부호 반전
+            cost[i, j] = -score
 
     row_ind, col_ind = linear_sum_assignment(cost)
 
-    assignments: List[MatchAssignment] = []
-    matched_need_ids: Set[str] = set()
+    assignments: List[MatchAssignment] = list(declared)
+    matched_need_ids: Set[str] = {a.need_item_id for a in declared}
+
     for r, c in zip(row_ind, col_ind):
-        if cost[r, c] >= 1e5:  # 자기자신 등으로 비활성화된 셀
+        if cost[r, c] >= 1e5:
             continue
         weight = sim[r, c]
         if weight < _min_match_sim():
             continue
         n = needs[r]
+        if n.item_id in matched_need_ids:
+            continue
         tkind, tid, tagent, ttext = targets[c]
         assignments.append(MatchAssignment(
             need_item_id=n.item_id, need_agent=n.agent_id, need_text=n.text,
@@ -284,6 +328,19 @@ def _find_consuming_step(plan: LocalPlan, need_text: str, exclude_ids: Set[int])
     return None
 
 
+_SEND_VERB_PREFIX_RE = re.compile(r"^(carry|bring|deliver|transport|pass)\s+", re.IGNORECASE)
+_DOORWAY_SUFFIX_RE = re.compile(r"\s+(to|for)\s+.*(doorway|pickup|delivery).*$", re.IGNORECASE)
+
+
+def _clean_item_phrase(text: str) -> str:
+    """PASS 액션 문장('bring laptop to doorway')에서 동사/목적지 문구를 제거해
+    깔끔한 아이템 설명('laptop')만 남김. 이미 깔끔한 텍스트(Offer의 can_provide
+    항목 등)는 그대로 통과."""
+    t = _SEND_VERB_PREFIX_RE.sub("", text)
+    t = _DOORWAY_SUFFIX_RE.sub("", t)
+    return t.strip() or text
+
+
 def apply_handoff(
     a: MatchAssignment, plans: Dict[str, LocalPlan],
 ) -> Tuple[Optional[ConflictEntry], Set[int]]:
@@ -292,7 +349,13 @@ def apply_handoff(
     provide_plan = plans[a.target_agent]
     affected: Set[int] = set()
 
-    send_step = _find_step_by_verb(provide_plan, a.target_text, _SEND_VERBS)
+    if a.source_step_id is not None:
+        # 선언된(declared) handoff — Local Plan에서 이미 정확히 어떤 스텝인지
+        # 알고 있으므로 키워드 검색 없이 그 스텝을 바로 사용
+        send_step = next((s for s in provide_plan.steps if s.step_id == a.source_step_id), None)
+    else:
+        send_step = _find_step_by_verb(provide_plan, a.target_text, _SEND_VERBS)
+
     if send_step is None:
         return ConflictEntry(
             ConflictType.DEPENDENCY, [], [a.target_agent],
@@ -302,13 +365,14 @@ def apply_handoff(
 
     recv_step = _find_step_by_verb(need_plan, a.target_text, _RECEIVE_VERBS)
     if recv_step is None:
+        clean_item = _clean_item_phrase(a.target_text)
         new_id = max([s.step_id for s in need_plan.steps], default=0) + 1
         recv_step = PlanStep(
             step_id=new_id,
             time_min=send_step.time_min + 2,
             room=need_plan.steps[0].room if need_plan.steps else "",
             agent_id=a.need_agent,
-            action=f"receive {a.target_text}",
+            action=f"receive {clean_item}",
             depends_on=[],
             handoff_type=None,
             target_agent=None,
@@ -581,17 +645,21 @@ def run(
     items = build_item_nodes(offers)
     assignments, unresolved_needs = compute_match_assignments(items, plans, offers, room_adjacency)
 
-    print(f"  [MATCH] {len(assignments)}개 확정 (Hungarian), {len(unresolved_needs)}개 미해결")
+    print(f"  [MATCH] {len(assignments)}개 확정 "
+          f"(선언 {sum(1 for a in assignments if a.source_step_id is not None)}개 + "
+          f"Hungarian {sum(1 for a in assignments if a.source_step_id is None)}개), "
+          f"{len(unresolved_needs)}개 미해결")
     handoff_conflicts: List[ConflictEntry] = []
     for a in assignments:
+        tag = "선언됨" if a.source_step_id is not None else f"sim={a.weight:.2f}"
         if a.target_kind == "PROVIDE":
-            print(f"    [HANDOFF] {a.target_agent} → {a.need_agent} : {a.target_text} (sim={a.weight:.2f})")
+            print(f"    [HANDOFF] {a.target_agent} → {a.need_agent} : {a.target_text} ({tag})")
             conflict, _ = apply_handoff(a, plans)
             if conflict:
                 handoff_conflicts.append(conflict)
         else:
             print(f"    [STATE_DEP] {a.need_agent} needs state from {a.target_agent}'s "
-                  f"step '{a.target_text}' (sim={a.weight:.2f})")
+                  f"step '{a.target_text}' ({tag})")
             apply_state_dependency(a, plans)
 
     # ── 2) SAME_ROOM 엣지 구축 + Conflict 워크리스트 (엣지 순회) ───────────────
