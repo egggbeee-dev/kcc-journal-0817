@@ -341,6 +341,40 @@ def _clean_item_phrase(text: str) -> str:
     return t.strip() or text
 
 
+def _propagate_time_forward(
+    plans: Dict[str, LocalPlan],
+    step_id: int,
+    min_time: int,
+    affected: Set[int],
+    _visited: Optional[Set[int]] = None,
+) -> None:
+    """
+    step_id의 시각을 min_time 이상으로 밀고, 그 스텝에 의존하는(depends_on에
+    포함하는) 다른 모든 스텝(agent 무관)도 필요하면 연쇄적으로 뒤로 민다.
+    한 곳만 밀고 끝나면 그 뒤에 매달린 스텝들이 시간상 모순되게 남을 수 있어서
+    (예: PASS 스텝이 그 준비 스텝보다 먼저인 채로 남는 경우) 이 전파가 필요함.
+    """
+    if _visited is None:
+        _visited = set()
+    if step_id in _visited:
+        return
+    _visited.add(step_id)
+
+    all_steps = [s for p in plans.values() for s in p.steps]
+    by_id = {s.step_id: s for s in all_steps}
+    target = by_id.get(step_id)
+    if target is None:
+        return
+
+    if target.time_min < min_time:
+        target.time_min = min_time
+        affected.add(step_id)
+
+    for s in all_steps:
+        if step_id in s.depends_on and s.time_min <= target.time_min:
+            _propagate_time_forward(plans, s.step_id, target.time_min + 2, affected, _visited)
+
+
 def apply_handoff(
     a: MatchAssignment, plans: Dict[str, LocalPlan],
 ) -> Tuple[Optional[ConflictEntry], Set[int]]:
@@ -384,6 +418,7 @@ def apply_handoff(
         affected.add(new_id)
 
     # 이 아이템을 실제로 쓰는 다른 스텝이 받기 전에 와 있으면 순서 재조정
+    # (그 스텝에 의존하는 후속 스텝들까지 연쇄적으로 전파)
     item_kw = _kw(a.target_text)
     for s in need_plan.steps:
         if s.step_id == recv_step.step_id:
@@ -392,10 +427,9 @@ def apply_handoff(
         if first in _RECEIVE_VERBS:
             continue
         if item_kw & _kw(s.action) and s.time_min <= recv_step.time_min:
-            s.time_min = recv_step.time_min + 2
             if recv_step.step_id not in s.depends_on:
                 s.depends_on = list(s.depends_on) + [recv_step.step_id]
-            affected.add(s.step_id)
+            _propagate_time_forward(plans, s.step_id, recv_step.time_min + 2, affected)
     need_plan.steps.sort(key=lambda s: (s.time_min, s.step_id))
 
     return None, affected
@@ -426,8 +460,7 @@ def apply_state_dependency(
         consumer.depends_on = list(consumer.depends_on) + [provide_step.step_id]
         affected.add(consumer.step_id)
     if consumer.time_min <= provide_step.time_min:
-        consumer.time_min = provide_step.time_min + 1
-        affected.add(consumer.step_id)
+        _propagate_time_forward(plans, consumer.step_id, provide_step.time_min + 1, affected)
 
     return affected
 
@@ -560,11 +593,8 @@ def resolve_conflict(conflict: ConflictEntry, plans: Dict[str, LocalPlan]) -> Se
         earlier_time = next(
             (o.time_min for p in plans.values() for o in p.steps if o.step_id == earlier_id), None,
         )
-        for plan in plans.values():
-            for s in plan.steps:
-                if s.step_id == later_id and earlier_time is not None:
-                    s.time_min = max(s.time_min, earlier_time + _TEMPORAL_WINDOW_MIN)
-                    affected.add(s.step_id)
+        if earlier_time is not None:
+            _propagate_time_forward(plans, later_id, earlier_time + _TEMPORAL_WINDOW_MIN, affected)
 
     elif conflict.conflict_type in (ConflictType.REDUNDANCY, ConflictType.CANNOT_DO, ConflictType.OBSERV):
         remove_id = conflict.step_ids[-1] if conflict.conflict_type == ConflictType.REDUNDANCY else conflict.step_ids[0]
