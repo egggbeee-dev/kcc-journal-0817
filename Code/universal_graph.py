@@ -309,7 +309,10 @@ def _kw(text: str) -> Set[str]:
 
 
 def _find_step_by_verb(plan: LocalPlan, item_text: str, verbs: Set[str]) -> Optional[PlanStep]:
-    item_kw = _kw(item_text)
+    # 원문 그대로 비교하면 "carry X to kitchen doorway for Y pickup" 같은
+    # 상투적 문구(kitchen/doorway/pickup 등)가 겹쳐서 서로 다른 아이템끼리
+    # 오매칭될 수 있음 — 동사/목적지 문구를 걷어낸 순수 아이템명으로 비교
+    item_kw = _kw(_clean_item_phrase(item_text))
     for s in plan.steps:
         first = s.action.lower().split()[0] if s.action.strip() else ""
         if first in verbs and (item_kw & _kw(s.action)):
@@ -427,7 +430,9 @@ def apply_handoff(
 
     # 이 아이템을 실제로 쓰는 다른 스텝이 받기 전에 와 있으면 순서 재조정
     # (그 스텝에 의존하는 후속 스텝들까지 연쇄적으로 전파)
-    item_kw = _kw(a.target_text)
+    # target_text 원문이 아니라 정제된 아이템명으로 비교 — "kitchen doorway for
+    # Y pickup" 같은 상투적 문구가 겹쳐서 다른 아이템끼리 오매칭되는 걸 방지
+    item_kw = _kw(_clean_item_phrase(a.target_text))
     for s in need_plan.steps:
         if s.step_id == recv_step.step_id:
             continue
