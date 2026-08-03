@@ -5,7 +5,7 @@ import os
 import threading
 from typing import List, Tuple, Union
 
-from config import MAX_NEW_TOKENS
+from config import MAX_NEW_TOKENS, TEMPERATURE
 
 ImagePathOrPaths = Union[str, List[str]]
 
@@ -80,6 +80,7 @@ def _run_qwen(
         out = _qwen_model.generate(
             **inputs,
             max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,  # 재현성을 위해 greedy decoding (temperature=0과 동등)
             return_dict_in_generate=True,
             output_scores=True,
         )
@@ -151,6 +152,7 @@ def _run_openai(
     kwargs = {
         "model": "gpt-4o",
         "max_tokens": MAX_NEW_TOKENS,
+        "temperature": TEMPERATURE,
         "messages": [{"role": "user", "content": content}],
     }
 
