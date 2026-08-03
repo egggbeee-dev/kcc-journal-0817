@@ -1,4 +1,4 @@
-# universal_graph.py  (v2 — embedding + Hungarian + edge-walk conflict check)
+# universal_graph.py  (v3 — embedding + node-centric greedy matching (P2P) + edge-walk conflict check)
 #
 # 2안: Universal Graph — 전체 노드를 다 올리고, 매칭 + 컨플릭트를 그래프
 # 자료구조 위에서 처리한다. 필터링(협업 무관 agent 제외) 없음. LLM 호출 없음.
@@ -18,8 +18,14 @@
 #                     cross-agent 순서 제약
 #
 #   알고리즘:
-#     - 매칭: NEED × (PROVIDE∪STEP) 가중치 행렬 → Hungarian Algorithm으로
-#             전역 최적 1:1 배정 (scipy.optimize.linear_sum_assignment)
+#     - 매칭: 노드 센트릭 그리디 (P2P 유지). 각 NEED 노드가 다른 need들이
+#             뭘 골랐는지 상관없이, 자기 텍스트와 전체 candidate 목록만
+#             갖고 독립적으로 유사도를 계산해 제일 좋은 걸 스스로 선택.
+#             이미 다른 need가 가져간 candidate만 건너뜀(consumed 체크,
+#             "먼저 온 사람이 임자"). 전체를 한 번에 보고 최적 조합을
+#             계산하는 Hungarian Algorithm과 달리, 이 방식은 "전체를
+#             보는 계산 주체"가 없어 P2P 요건을 충족함 — 대신 전역
+#             최적해는 보장하지 않음(트레이드오프로 감수).
 #     - Conflict: SAME_ROOM 엣지를 미리 만들어두고, 그 엣지를 순회하며 체크.
 #                 문제 수정 후에는 전체 재스캔이 아니라 영향받은 노드의
 #                 "이웃 엣지만" 다시 확인 (1-hop 전파)
@@ -31,6 +37,12 @@
 #           (약한 대체재 — 실제 의미 유사도 포착력은 sentence-transformers보다
 #           떨어짐. Colab 등 인터넷 되는 환경에서는 sentence-transformers 설치
 #           권장: `pip install sentence-transformers`).
+#
+# P2P 정리: 관찰/Offer/Local Plan + 이 매칭 단계는 분산(P2P) — 계산 주체가
+#           항상 "그 need를 가진 agent 자신"임. Conflict 체크와 Kahn's
+#           algorithm은 여전히 중앙집중형 그래프 리즈닝 모듈이 전체를 모아서
+#           계산함 (완전 P2P는 아니고, 관찰+로컬플래닝+매칭은 분산 /
+#           conflict+merge는 중앙집중인 하이브리드 구조).
 
 from __future__ import annotations
 
@@ -42,7 +54,6 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
-from scipy.optimize import linear_sum_assignment
 
 from config import FUZZY_STOPWORDS
 from models import ConflictEntry, ConflictType, LocalPlan, Offer, PlanStep
@@ -152,7 +163,7 @@ def build_item_nodes(offers: Dict[str, Offer]) -> List[ItemNode]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MATCH 후보 그래프 + Hungarian Algorithm으로 전역 최적 매칭
+# MATCH 후보 그래프 + 노드 센트릭 그리디 매칭 (P2P)
 # ══════════════════════════════════════════════════════════════════════════════
 
 MIN_MATCH_SIM_ST    = 0.35   # sentence-transformers 사용 시 (코사인 유사도 스케일이 큼)
@@ -207,7 +218,7 @@ def apply_declared_handoffs(
 
 
 def _already_declared_agent_pairs(declared: List[MatchAssignment]) -> Set[Tuple[str, str]]:
-    """이미 선언된 (provide_agent, need_agent) 쌍 — Hungarian 대상에서 제외용."""
+    """이미 선언된 (provide_agent, need_agent) 쌍 — 그리디 매칭 대상에서 제외용."""
     return {(a.target_agent, a.need_agent) for a in declared}
 
 
@@ -218,29 +229,40 @@ def compute_match_assignments(
     room_adjacency: Optional[Dict[Tuple[str, str], int]] = None,
 ) -> Tuple[List[MatchAssignment], List[str]]:
     """
-    NEED × (PROVIDE 아이템 ∪ 다른 agent의 Step) 가중치 그래프를 만들고,
-    Hungarian Algorithm으로 전역 최적 1:1 배정을 계산한다.
+    NEED × (PROVIDE 아이템 ∪ 다른 agent의 Step) 매칭.
 
-    단, Local Plan에서 이미 명시적으로 확정된 PASS(target_agent 포함)는
+    P2P 유지를 위해 Hungarian Algorithm(전체 가중치 행렬을 한 번에 보고
+    전역 최적해를 계산하는 방식) 대신, "노드 센트릭" 방식을 쓴다:
+    각 NEED 노드가 — 다른 need들이 뭘 선택했는지 상관없이 — 자기 텍스트와
+    전체 candidate 목록(이미 브로드캐스트로 다 알고 있음)만 갖고 독립적으로
+    유사도를 계산해서 제일 좋은 걸 스스로 고른다. 순서대로 하나씩 처리하며,
+    이미 다른 need가 가져간(consumed) 후보만 건너뛴다 — 이건 "먼저 온 사람이
+    임자"라는 최소한의 충돌 방지 규칙일 뿐, 전체를 보고 최적 조합을 계산하는
+    것과는 다르다 (전역 최적해는 보장하지 않음 — 트레이드오프로 감수).
+
+    Local Plan에서 이미 명시적으로 확정된 PASS(target_agent 포함)는
     1단계(apply_declared_handoffs)에서 먼저 신뢰하고, 그 agent 쌍은
-    Hungarian 매칭 대상에서 제외한다 (이미 정해진 걸 재배정하지 않도록).
+    이 단계에서 건드리지 않는다.
 
-    반환: (확정된 MatchAssignment 리스트 — 선언분+Hungarian분, 매칭 안 된 need_item_id 리스트)
+    반환: (확정된 MatchAssignment 리스트 — 선언분+그리디매칭분, 매칭 안 된 need_item_id 리스트)
     """
     declared = apply_declared_handoffs(plans)
     declared_pairs = _already_declared_agent_pairs(declared)
     # 이미 선언된 handoff를 "받은" agent들 — 이 agent들의 실제 need는
     # (텍스트 매칭 없이도) 그 handoff가 채워주는 것으로 간주해 매칭 완료 처리한다.
-    # (예: living_room이 kitchen한테서 빵/커피를 선언된 PASS로 이미 받았다면,
-    #  living_room의 "snacks or drinks" need를 별도로 미해결 처리하지 않음)
     agents_with_declared_incoming = {a.need_agent for a in declared}
 
     needs = [it for it in items if it.kind == "NEED"]
     provides = [it for it in items if it.kind == "PROVIDE"]
     all_steps = [s for p in plans.values() for s in p.steps]
 
-    if not needs:
-        return declared, []
+    assignments: List[MatchAssignment] = list(declared)
+    matched_need_ids: Set[str] = {a.need_item_id for a in declared}
+    matched_need_ids |= {n.item_id for n in needs if n.agent_id in agents_with_declared_incoming}
+
+    remaining_needs = [n for n in needs if n.item_id not in matched_need_ids]
+    if not remaining_needs:
+        return assignments, []
 
     targets: List[Tuple[str, str, str, str]] = []  # (kind, id, agent_id, text)
     for p in provides:
@@ -249,54 +271,44 @@ def compute_match_assignments(
         targets.append(("STEP", str(s.step_id), s.agent_id, s.action))
 
     if not targets:
-        already_satisfied = [n.item_id for n in needs if n.agent_id in agents_with_declared_incoming]
-        unresolved = [n.item_id for n in needs if n.item_id not in already_satisfied]
-        return declared, unresolved
+        unresolved = [n.item_id for n in needs if n.item_id not in matched_need_ids]
+        return assignments, unresolved
 
-    need_texts = [n.text for n in needs]
+    need_texts = [n.text for n in remaining_needs]
     target_texts = [t[3] for t in targets]
     combined_vecs = embed_texts(need_texts + target_texts)
     need_vecs = combined_vecs[: len(need_texts)]
     target_vecs = combined_vecs[len(need_texts):]
     sim = cosine_sim_matrix(need_vecs, target_vecs)
 
-    cost = np.full(sim.shape, 1e6)
-    for i, n in enumerate(needs):
-        need_room = offers[n.agent_id].room_type
+    threshold = _min_match_sim()
+    consumed = [False] * len(targets)
+
+    # 각 NEED가 "자기 순서가 왔을 때, 그 시점에 남아있는 candidate 중에서"
+    # 스스로 제일 좋은 걸 고름 — 순서 자체에 우선순위 로직은 없음(그냥 리스트 순서)
+    for i, n in enumerate(remaining_needs):
+        best_j: Optional[int] = None
+        best_score = -1.0
         for j, (tkind, tid, tagent, ttext) in enumerate(targets):
             if tagent == n.agent_id:
                 continue  # 자기 자신은 매칭 대상 아님
             if (tagent, n.agent_id) in declared_pairs:
-                continue  # 이미 로컬 플랜에서 이 쌍끼리 확정됨 — Hungarian이 건드리지 않음
-            urgency_w = n.urgency / 5.0
-            dist_pen = room_distance(need_room, offers[tagent].room_type if tagent in offers else "",
-                                      room_adjacency) * ROOM_DIST_PENALTY
-            score = sim[i, j] * urgency_w - dist_pen
-            cost[i, j] = -score
+                continue  # 이미 로컬 플랜에서 이 쌍끼리 확정됨
+            if consumed[j]:
+                continue  # 이미 다른 need가 가져감
+            score = float(sim[i, j])
+            if score > best_score:
+                best_score, best_j = score, j
 
-    row_ind, col_ind = linear_sum_assignment(cost)
-
-    assignments: List[MatchAssignment] = list(declared)
-    matched_need_ids: Set[str] = {a.need_item_id for a in declared}
-    # 선언된 handoff를 이미 받은 agent의 실제 need도 매칭 완료로 표시 (회계 정정)
-    matched_need_ids |= {n.item_id for n in needs if n.agent_id in agents_with_declared_incoming}
-
-    for r, c in zip(row_ind, col_ind):
-        if cost[r, c] >= 1e5:
-            continue
-        weight = sim[r, c]
-        if weight < _min_match_sim():
-            continue
-        n = needs[r]
-        if n.item_id in matched_need_ids:
-            continue
-        tkind, tid, tagent, ttext = targets[c]
-        assignments.append(MatchAssignment(
-            need_item_id=n.item_id, need_agent=n.agent_id, need_text=n.text,
-            target_kind=tkind, target_id=tid, target_agent=tagent,
-            target_text=ttext, weight=float(weight),
-        ))
-        matched_need_ids.add(n.item_id)
+        if best_j is not None and best_score >= threshold:
+            consumed[best_j] = True
+            tkind, tid, tagent, ttext = targets[best_j]
+            assignments.append(MatchAssignment(
+                need_item_id=n.item_id, need_agent=n.agent_id, need_text=n.text,
+                target_kind=tkind, target_id=tid, target_agent=tagent,
+                target_text=ttext, weight=best_score,
+            ))
+            matched_need_ids.add(n.item_id)
 
     unresolved = [n.item_id for n in needs if n.item_id not in matched_need_ids]
     return assignments, unresolved
@@ -776,7 +788,7 @@ def run(
     for aid in agent_ids:
         events.append({"type": "node", "kind": "agent", "id": aid})
 
-    # ── 1) 매칭 (그래프 + Hungarian Algorithm) ────────────────────────────────
+    # ── 1) 매칭 (그래프 + 노드 센트릭 그리디, P2P) ────────────────────────────
     items = build_item_nodes(offers)
     for it in items:
         events.append({
@@ -794,7 +806,7 @@ def run(
 
     print(f"  [MATCH] {len(assignments)}개 확정 "
           f"(선언 {sum(1 for a in assignments if a.source_step_id is not None)}개 + "
-          f"Hungarian {sum(1 for a in assignments if a.source_step_id is None)}개), "
+          f"그리디매칭 {sum(1 for a in assignments if a.source_step_id is None)}개), "
           f"{len(unresolved_needs)}개 미해결")
     handoff_conflicts: List[ConflictEntry] = []
     for a in assignments:
