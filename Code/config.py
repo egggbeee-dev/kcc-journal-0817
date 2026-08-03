@@ -1,4 +1,5 @@
 MAX_NEW_TOKENS         = 2048
+TEMPERATURE            = 0.0   # 재현성을 위해 최대한 결정론적으로 (완전한 결정론 보장은 아님)
 MAX_CAN_DO             = 8
 MAX_CANNOT_DO          = 5
 UNCERTAINTY_THRESH     = 0.50
