@@ -387,6 +387,30 @@ def _propagate_time_forward(
             _propagate_time_forward(plans, s.step_id, target.time_min + 2, affected, _visited)
 
 
+def _outgoing_chain_step_ids(plan: LocalPlan) -> Set[int]:
+    """
+    이 plan 안에서 PASS 스텝 자신 + 그 PASS로 이어지는 depends_on 조상들의
+    step_id 집합. 예: prep(A) -> prep(B) -> PASS(C)면 {A,B,C} 전부 포함.
+    이 집합에 속한 스텝은 "받은 아이템을 쓰는 스텝"으로 취급하면 안 됨 —
+    얘네는 (같은 이름이라도 다른 물건일 수 있는) 자기 아이템을 내보내는
+    파이프라인이지, 받은 걸 소비하는 스텝이 아니기 때문.
+    """
+    by_id = {s.step_id: s for s in plan.steps}
+    result: Set[int] = set()
+
+    def walk(sid: int) -> None:
+        if sid in result or sid not in by_id:
+            return
+        result.add(sid)
+        for dep in by_id[sid].depends_on:
+            walk(dep)
+
+    for s in plan.steps:
+        if s.handoff_type == "PASS":
+            walk(s.step_id)
+    return result
+
+
 def apply_handoff(
     a: MatchAssignment, plans: Dict[str, LocalPlan],
 ) -> Tuple[Optional[ConflictEntry], Set[int]]:
@@ -442,11 +466,17 @@ def apply_handoff(
     # target_text 원문이 아니라 정제된 아이템명으로 비교 — "kitchen doorway for
     # Y pickup" 같은 상투적 문구가 겹쳐서 다른 아이템끼리 오매칭되는 걸 방지
     item_kw = _kw(_clean_item_phrase(a.target_text))
+    outgoing_ids = _outgoing_chain_step_ids(need_plan)
     for s in need_plan.steps:
         if s.step_id == recv_step.step_id:
             continue
         first = s.action.lower().split()[0] if s.action.strip() else ""
         if first in _RECEIVE_VERBS:
+            continue
+        if s.step_id in outgoing_ids:
+            # 이 스텝은 (자신이 PASS든, PASS로 이어지는 준비 단계든) 뭔가를
+            # 내보내는 파이프라인 소속 — 이름이 같아도 다른 물건일 수 있으므로
+            # "받은 아이템을 쓰는 스텝"으로 강제 순서 조정하지 않음
             continue
         if item_kw & _kw(s.action) and s.time_min <= recv_step.time_min:
             if recv_step.step_id not in s.depends_on:
