@@ -229,6 +229,11 @@ def compute_match_assignments(
     """
     declared = apply_declared_handoffs(plans)
     declared_pairs = _already_declared_agent_pairs(declared)
+    # 이미 선언된 handoff를 "받은" agent들 — 이 agent들의 실제 need는
+    # (텍스트 매칭 없이도) 그 handoff가 채워주는 것으로 간주해 매칭 완료 처리한다.
+    # (예: living_room이 kitchen한테서 빵/커피를 선언된 PASS로 이미 받았다면,
+    #  living_room의 "snacks or drinks" need를 별도로 미해결 처리하지 않음)
+    agents_with_declared_incoming = {a.need_agent for a in declared}
 
     needs = [it for it in items if it.kind == "NEED"]
     provides = [it for it in items if it.kind == "PROVIDE"]
@@ -244,7 +249,9 @@ def compute_match_assignments(
         targets.append(("STEP", str(s.step_id), s.agent_id, s.action))
 
     if not targets:
-        return declared, [n.item_id for n in needs]
+        already_satisfied = [n.item_id for n in needs if n.agent_id in agents_with_declared_incoming]
+        unresolved = [n.item_id for n in needs if n.item_id not in already_satisfied]
+        return declared, unresolved
 
     need_texts = [n.text for n in needs]
     target_texts = [t[3] for t in targets]
@@ -271,6 +278,8 @@ def compute_match_assignments(
 
     assignments: List[MatchAssignment] = list(declared)
     matched_need_ids: Set[str] = {a.need_item_id for a in declared}
+    # 선언된 handoff를 이미 받은 agent의 실제 need도 매칭 완료로 표시 (회계 정정)
+    matched_need_ids |= {n.item_id for n in needs if n.agent_id in agents_with_declared_incoming}
 
     for r, c in zip(row_ind, col_ind):
         if cost[r, c] >= 1e5:
