@@ -96,18 +96,29 @@ PASS — physical delivery to room boundary:
   USE WHEN: you physically carry an item to the doorway for a specific teammate.
   ACTION must start with: "carry" or "bring"
   target_agent MUST be one of the teammate agent_ids listed above (never yourself).
+  The item MUST be one of the items listed in your can_provide above — if
+  can_provide is empty, you CANNOT use PASS at all, no matter what.
   CORRECT: {"action":"carry snack tray to doorway","handoff_type":"PASS",
              "target_agent":"agent_C","depends_on":[1,2]}
   WRONG: PASS on preparation steps (place, arrange, set up, organize)
   WRONG: PASS on non-physical items (sink, counter, status, confirmation)
+  WRONG: PASS on furniture or fixtures (table, chair, sofa, mirror, etc.) —
+    these can never be carried, even if a teammate needs them "cleared" or
+    "ready". If a teammate needs something about your zone's state (not an
+    object), just do the prep steps (clean/arrange/clear) and stop — do NOT
+    invent a PASS or INFORM step to announce it. The coordination layer
+    matches states across agents automatically; you don't need to signal it.
   MAXIMUM: 1-2 PASS steps total. Only for items in your can_provide list.
 
 INFORM — status notification (no physical movement):
-  USE WHEN: you want to notify a specific teammate of completion.
+  USE WHEN: you want to notify a specific teammate of completion of a
+  physical handoff (e.g. "the tray is at the doorway now"). Do NOT use
+  INFORM to announce non-physical state changes (table cleared, room tidy,
+  etc.) — those don't need to be announced.
   CORRECT: {"action":"notify agent_C: snacks are ready at doorway",
              "handoff_type":"INFORM","target_agent":"agent_C"}
 
-KEY: "carry X to doorway" -> PASS | "notify <agent>" -> INFORM | all others -> null
+KEY: "carry X to doorway" (X in can_provide) -> PASS | notify about a PASS -> INFORM | all others -> null
 """.strip()
 
 
@@ -149,7 +160,9 @@ PLANNING RULES:
    - Prepare the item first (1-2 prep steps)
    - Then add ONE PASS step naming the SPECIFIC teammate agent_id who needs it
    - PASS step must have depends_on=[prep step ids]
-5. INFORM - if you want to notify a specific teammate of completion.
+   If can_provide IS empty, do not add any PASS step — just do your prep/
+   cleaning steps and stop there.
+5. INFORM - only to announce a physical PASS handoff, not a state change.
 6. depends_on must ONLY reference your OWN step_ids (never a teammate's).
 7. Return ONLY valid JSON inside <JSON> tags.
 
@@ -258,7 +271,11 @@ def _parse_local_plan(
             hq_list.append(HQEntry(sid, f"Is '{action}' feasible?", step_unc))
 
     steps.sort(key=lambda s: (s.time_min, s.step_id))
-    steps = _normalize_pass(steps, valid_target_ids=set(other_offers.keys()))
+    steps = _normalize_pass(
+        steps,
+        valid_target_ids=set(other_offers.keys()),
+        can_provide=my_offer.can_provide,
+    )
 
     handoffs = [
         Handoff(s.step_id, s.action, s.handoff_type, s.target_agent,
@@ -271,10 +288,25 @@ def _parse_local_plan(
     return LocalPlan(my_agent.agent_id, steps, compute_plan_uncertainty(all_unc), hq_list, handoffs)
 
 
-def _normalize_pass(steps: List[PlanStep], valid_target_ids: Set[str]) -> List[PlanStep]:
-    """비정상 PASS 제거 (N-agent: target은 valid_target_ids 중 하나여야 함)."""
+def _normalize_pass(
+    steps: List[PlanStep],
+    valid_target_ids: Set[str],
+    can_provide: List[str],
+) -> List[PlanStep]:
+    """비정상 PASS 제거 (N-agent: target은 valid_target_ids 중 하나여야 함).
+
+    v2 — can_provide 교차검증 추가. config.py의 NON_PASSABLE_KW 필터는
+    Offer 단계(offer.py)에서 한 번 걸러주지만, 이건 "무엇을 provide한다고
+    선언했는지"만 걸러줄 뿐, Local Plan 생성 단계에서 LLM이 프롬프트 지시를
+    무시하고 can_provide에 없는 것(또는 can_provide가 아예 비어있는데도)에
+    PASS를 붙이는 걸 막지는 못한다 (실측: living_room이 can_provide 밖의
+    "clean dining table"에 PASS를 건 사례). 여기서 한 번 더 "PASS로 선언된
+    아이템이 실제 can_provide 목록의 아이템과 키워드가 겹치는가"를 검증해서
+    이중 방어선을 둔다 — Offer 필터를 어떻게든 우회한 PASS도 여기서 잡힘.
+    """
     _CARRY = {"carry", "bring", "deliver", "transport", "move", "transfer"}
     _RECV  = {"place", "set", "organize", "receive", "pick", "get", "put", "sort"}
+    provide_kws = [_kw(p) for p in can_provide]
 
     for s in steps:
         if s.handoff_type != "PASS":
@@ -288,6 +320,17 @@ def _normalize_pass(steps: List[PlanStep], valid_target_ids: Set[str]) -> List[P
 
         if first in _RECV:
             print(f"  [NORM] step{s.step_id} PASS removed: receiver verb '{first}'")
+            s.handoff_type = None; s.target_agent = None; continue
+
+        if not can_provide:
+            print(f"  [NORM] step{s.step_id} PASS removed: can_provide is empty "
+                  f"(nothing declared providable, cannot PASS '{s.action}')")
+            s.handoff_type = None; s.target_agent = None; continue
+
+        action_kw = _kw(s.action) - _CARRY  # 동사 자체는 비교 대상에서 제외
+        if not any(action_kw & pk for pk in provide_kws):
+            print(f"  [NORM] step{s.step_id} PASS removed: '{s.action}' does not "
+                  f"match any declared can_provide item {can_provide}")
             s.handoff_type = None; s.target_agent = None; continue
 
         if not s.depends_on:
