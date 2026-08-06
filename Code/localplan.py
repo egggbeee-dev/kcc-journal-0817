@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Set, Tuple
 
 from agent import Agent
-from config import AGENT_STEP_STRIDE, UNCERTAINTY_THRESH
+from config import AGENT_STEP_STRIDE, PASS_SEND_VERBS, UNCERTAINTY_THRESH
 from models import Handoff, HQEntry, LocalPlan, Offer, PlanStep
 from offer import _is_passable, _kw, _vlm_with_retry
 from utils import (
@@ -304,7 +304,14 @@ def _normalize_pass(
     아이템이 실제 can_provide 목록의 아이템과 키워드가 겹치는가"를 검증해서
     이중 방어선을 둔다 — Offer 필터를 어떻게든 우회한 PASS도 여기서 잡힘.
     """
-    _CARRY = {"carry", "bring", "deliver", "transport", "move", "transfer"}
+    # v2 — 동사 화이트리스트를 config.PASS_SEND_VERBS(단일 소스)로 통일.
+    # 예전엔 이 함수가 {"carry","bring","deliver","transport","move","transfer"}를,
+    # universal_graph.py의 탐색 로직은 {"carry","bring","deliver","transport","pass"}를
+    # 따로 갖고 있어서 목록이 갈라져 있었음 — "move"/"transfer"로 시작하는 PASS는
+    # 여기서 안 걸러지고 통과했다가, 뒷단(apply_handoff)의 탐색에서 못 찾아서
+    # "no send step"이라는 애매한 DEPENDENCY 컨플릭트로만 남는 문제가 있었음.
+    # 이제 첫 단어를 여기서 명시적으로 검증해서 원인을 바로 로그에 남긴다.
+    _CARRY = PASS_SEND_VERBS
     _RECV  = {"place", "set", "organize", "receive", "pick", "get", "put", "sort"}
     provide_kws = [_kw(p) for p in can_provide]
 
@@ -313,6 +320,11 @@ def _normalize_pass(
             continue
 
         first = s.action.lower().split()[0] if s.action.strip() else ""
+
+        if first not in _CARRY:
+            print(f"  [NORM] step{s.step_id} PASS removed: action must start with a "
+                  f"delivery verb {sorted(_CARRY)} (got '{first}' in '{s.action}')")
+            s.handoff_type = None; s.target_agent = None; continue
 
         if not s.target_agent or s.target_agent not in valid_target_ids:
             print(f"  [NORM] step{s.step_id} PASS removed: no valid target_agent")
