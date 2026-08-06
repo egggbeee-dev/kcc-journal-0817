@@ -548,6 +548,21 @@ def apply_handoff(
 def apply_state_dependency(
     a: MatchAssignment, plans: Dict[str, LocalPlan],
 ) -> Set[int]:
+    """
+    STEP 타겟 매칭 → need-agent의 "소비 스텝"을 provide-step 이후로 오도록
+    cross-agent DEPENDS_ON 엣지만 추가한다.
+
+    v2 — outgoing chain 제외 추가. _find_consuming_step은 키워드 겹침만
+    보고 소비 스텝을 고르는데, need 텍스트에 우연히 겹치는 단어가 있으면
+    (예: need="cleared space for serving TRAY", 그리고 같은 agent가 마침
+    "arrange ... on serving TRAY"라는 *내보내는* 스텝을 갖고 있는 경우)
+    "무언가를 준비해서 내보내는 파이프라인 스텝"을 엉뚱하게 "이 need를
+    소비하는 스텝"으로 오인할 수 있음 (실측으로 확인된 버그 — apply_handoff
+    에는 이미 _outgoing_chain_step_ids로 이 방어가 있었는데
+    apply_state_dependency에는 빠져 있었음). PASS로 뭔가를 내보내는 체인에
+    속한 스텝은 애초에 "이 need를 위해 대기하는" 소비자가 될 수 없으므로
+    후보에서 제외한다.
+    """
     need_plan = plans[a.need_agent]
     provide_step_id = int(a.target_id)
     provide_step = next(
@@ -556,7 +571,8 @@ def apply_state_dependency(
     if provide_step is None:
         return set()
 
-    consumer = _find_consuming_step(need_plan, a.need_text, exclude_ids=set())
+    outgoing_ids = _outgoing_chain_step_ids(need_plan)
+    consumer = _find_consuming_step(need_plan, a.need_text, exclude_ids=outgoing_ids)
     affected: Set[int] = set()
     if consumer is None:
         return affected
