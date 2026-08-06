@@ -11,6 +11,14 @@ AUTO_HQ_ANSWER: str | None = None
 VALID_REASONS  = {"NO_OBJECT", "NO_CAPABILITY", "UNCERTAIN"}
 VALID_AGENTS   = {"agent_A", "agent_B"}   # 하위 호환용. N-agent는 build_agents()가 동적으로 생성
 VALID_HANDOFFS = {"PASS", "INFORM"}
+# PASS 스텝의 "물리적 전달" 동사 화이트리스트 — 단일 소스.
+# localplan.py의 _normalize_pass(검증)와 universal_graph.py의
+# _find_step_by_verb(탐색)가 이걸 각자 다른 목록으로 갖고 있던 게
+# 실측으로 확인된 버그 소지였음 — LLM이 이 화이트리스트 밖의 동사
+# ("hand", "give" 등)로 PASS를 만들면, 검증 단계는 통과시키고 탐색
+# 단계는 못 찾아서 "no send step" 에러만 애매하게 남는 문제. 이제
+# 두 파일 다 이 상수 하나를 import해서 씀 — 목록이 갈라질 수 없음.
+PASS_SEND_VERBS = {"carry", "bring", "deliver", "transport", "pass"}
 VALID_PROPOSAL_FIELDS = {"time_min", "action", "depends_on", "delete"}
 
 # ── N-AGENT 확장 설정 ─────────────────────────────────────────────────────────
