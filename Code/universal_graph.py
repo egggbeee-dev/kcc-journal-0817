@@ -218,65 +218,33 @@ def room_distance(
 # 두 파일에서 서로 다르게 취급되는 잠재 버그가 있었음. 하나로 통일함.
 
 
-def apply_declared_handoffs(
+DECLARED_BID_BONUS = 0.5           # 근거 있는 declared PASS에 주는 강한 prior —
+                                    # 절대적 특권은 아니라 threshold/경쟁에 여전히 걸릴 수 있음
+
+
+def _gather_declared_candidates(
     plans: Dict[str, LocalPlan],
-    offers: Optional[Dict[str, Offer]] = None,
-) -> List[MatchAssignment]:
+) -> List[Tuple[int, str, str, str]]:
     """
-    1단계 — Local Plan 생성 단계에서 LLM이 이미 명시적으로 정한 PASS 타겟
-    (handoff_type="PASS" + target_agent 확정)을 auction보다 먼저 신뢰한다.
+    Local Plan에서 LLM이 스스로 만든 PASS 선언들을 모아 auction 후보로 변환.
 
-    v5 — need 근거 검증 추가. persona가 "능동적으로 도와라"를 지시하다 보니
-    LLM이 target agent의 need_from_other와 무관한 아이템을 스스로 만들어
-    PASS로 선언하는 경우가 실측으로 확인됨 (예: 아무도 요청 안 한 laptop을
-    bedroom이 living_room에 handoff). 이런 "근거 없는 선의"까지 최우선
-    신뢰(=auction 검증 생략)를 주는 건 need_from_other 기반 협업 프로토콜
-    자체를 우회하는 뒷문이 되므로, target agent의 need_from_other와 키워드가
-    전혀 안 겹치면 declared 목록에서 제외하고 auction 후보로 강등한다
-    (완전 차단은 아님 — 정말 누군가의 need와 의미적으로 맞아떨어지면
-    auction에서 다시 매칭될 수 있음. 안 맞으면 그냥 매칭 안 되고 끝남).
-    offers가 주어지지 않으면(구버전 호환) 검증 없이 기존처럼 전부 신뢰.
+    v6 — 별도의 "무조건 신뢰" 우선순위 계층(구 apply_declared_handoffs)을
+    없애고, declared PASS를 auction 내부의 강한 prior(bid 보너스)로
+    흡수했다. 예전 계층 구조가 "식탁을 나른다", "요청 안 한 laptop을
+    보낸다" 같은 근거 없는 선언까지 강제로 통과시키는 버그의 근원이었음
+    — need 근거 검증(강등 로직)을 별도로 계속 추가해가는 대신, auction
+    이라는 단일 메커니즘 안에 통합하는 게 더 단순하고 일관됨.
+
+    반환: (step_id, provide_agent, target_agent, item_text) 리스트.
+    실제 grounding 판단(보너스를 줄지)과 승자 결정은 compute_match_assignments
+    안에서 나머지 후보들과 동일한 auction 로직으로 처리됨.
     """
-    declared: List[MatchAssignment] = []
-    offers = offers or {}
-
+    out: List[Tuple[int, str, str, str]] = []
     for agent_id, plan in plans.items():
         for s in plan.steps:
             if s.handoff_type == "PASS" and s.target_agent and s.target_agent in plans:
-                item_text = s.action
-                target_offer = offers.get(s.target_agent)
-
-                if target_offer is not None:
-                    item_kw = _kw(item_text)
-                    need_kw: Set[str] = set()
-                    for n in target_offer.need_from_other:
-                        need_kw |= _kw(n)
-                    if item_kw and need_kw and not (item_kw & need_kw):
-                        print(
-                            f"  [DECLARE] step{s.step_id} ({agent_id}→{s.target_agent}) "
-                            f"PASS 강등: '{item_text}'가 {s.target_agent}의 "
-                            f"need_from_other={target_offer.need_from_other}와 근거 없음 "
-                            f"→ auction 후보로 넘김 (최우선 신뢰 박탈)"
-                        )
-                        continue  # declared에 안 넣음 — auction이 알아서 판단
-
-                declared.append(MatchAssignment(
-                    need_item_id=f"__declared__{s.step_id}",
-                    need_agent=s.target_agent,
-                    need_text=item_text,
-                    target_kind="PROVIDE",
-                    target_id=f"__declared__{s.step_id}",
-                    target_agent=agent_id,
-                    target_text=item_text,
-                    weight=1.0,  # need 근거 확인됨(또는 검증 불가) → 최고 신뢰도
-                    source_step_id=s.step_id,
-                ))
-    return declared
-
-
-def _already_declared_agent_pairs(declared: List[MatchAssignment]) -> Set[Tuple[str, str]]:
-    """이미 선언된 (provide_agent, need_agent) 쌍 — auction 대상에서 제외용."""
-    return {(a.target_agent, a.need_agent) for a in declared}
+                out.append((s.step_id, agent_id, s.target_agent, s.action))
+    return out
 
 
 def compute_match_assignments(
@@ -287,7 +255,7 @@ def compute_match_assignments(
     max_rounds: int = DEFAULT_AUCTION_ROUNDS,
 ) -> Tuple[List[MatchAssignment], List[str]]:
     """
-    NEED × (PROVIDE 아이템 ∪ 다른 agent의 Step) 매칭.
+    NEED × (PROVIDE 아이템 ∪ 다른 agent의 Step ∪ declared PASS 후보) 매칭.
 
     CBAA(Consensus-Based Auction Algorithm) 스타일 auction: 승자는 처리
     순서가 아니라 bid 값(임베딩 유사도)으로 결정된다. 모든 need-agent는
@@ -298,40 +266,50 @@ def compute_match_assignments(
     고정 tie-break — 어느 need-agent가 계산해도 같은 결론에 도달한다
     (consensus, 중앙 중재자 없음).
 
-    Local Plan에서 이미 명시적으로 확정된 PASS(target_agent 포함) 중
-    need_from_other로 근거가 확인된 것은 apply_declared_handoffs에서
-    먼저 신뢰하고, 그 agent 쌍은 이 단계에서 건드리지 않는다. 근거 없이
-    강등된 PASS는 여기서 다른 PROVIDE/STEP 후보와 동등하게 경쟁한다.
+    v6 — declared PASS를 별도 우선순위 계층이 아니라 auction 내부의 bid
+    보너스로 통합. Local Plan에서 LLM이 스스로 만든 PASS 선언은:
+      1) target agent의 need 중 하나와 임베딩 유사도가 grounding
+         threshold(=_min_match_sim(), 나머지 매칭과 동일한 기준)를 넘으면
+         "근거 있음"으로 보고 DECLARED_BID_BONUS를 받는다 — 사실상 거의
+         항상 이기지만, 그 need를 다른 진짜 후보가 훨씬 잘 채울 수 있으면
+         질 수도 있음(완전한 특권이 아님).
+      2) 근거가 없으면 보너스 없이 다른 PROVIDE/STEP 후보와 완전히 동등한
+         자격으로 경쟁 — 별도의 "강등" 처리 없이 auction 메커니즘 자체가
+         자연스럽게 걸러냄. (이전 버전은 grounding 판단이 키워드 겹침이라
+         나머지 매칭 로직 전부가 임베딩 기반인 것과 일관성이 없었음 —
+         이제 grounding도 동일한 임베딩 유사도로 판단한다.)
 
     반환: (확정된 MatchAssignment 리스트, 매칭 안 된 need_item_id 리스트)
     """
-    declared = apply_declared_handoffs(plans, offers)
-    declared_pairs = _already_declared_agent_pairs(declared)
-    agents_with_declared_incoming = {a.need_agent for a in declared}
-
     needs = [it for it in items if it.kind == "NEED"]
     provides = [it for it in items if it.kind == "PROVIDE"]
     all_steps = [s for p in plans.values() for s in p.steps]
+    declared_candidates = _gather_declared_candidates(plans)
 
-    assignments: List[MatchAssignment] = list(declared)
-    matched_need_ids: Set[str] = {a.need_item_id for a in declared}
-    matched_need_ids |= {n.item_id for n in needs if n.agent_id in agents_with_declared_incoming}
+    if not needs:
+        return [], []
 
-    remaining_needs = [n for n in needs if n.item_id not in matched_need_ids]
-    if not remaining_needs:
-        return assignments, []
-
-    targets: List[Tuple[str, str, str, str]] = []  # (kind, id, agent_id, text)
+    # targets: (kind, id, agent_id, text, declared_source_step_id)
+    targets: List[Tuple[str, str, str, str, Optional[int]]] = []
     for p in provides:
-        targets.append(("PROVIDE", p.item_id, p.agent_id, p.text))
+        targets.append(("PROVIDE", p.item_id, p.agent_id, p.text, None))
     for s in all_steps:
-        targets.append(("STEP", str(s.step_id), s.agent_id, s.action))
+        targets.append(("STEP", str(s.step_id), s.agent_id, s.action, None))
+
+    declared_target_idx: Set[int] = set()
+    declared_target_agent: Dict[int, str] = {}
+    for step_id, provide_agent, target_agent, text in declared_candidates:
+        # PROVIDE로 취급 — apply_handoff가 source_step_id로 바로 찾아가므로
+        # verb 검색 없이 정확한 스텝을 사용함 (기존 declared 경로와 동일)
+        targets.append(("PROVIDE", f"__declared__{step_id}", provide_agent, text, step_id))
+        j = len(targets) - 1
+        declared_target_idx.add(j)
+        declared_target_agent[j] = target_agent
 
     if not targets:
-        unresolved = [n.item_id for n in needs if n.item_id not in matched_need_ids]
-        return assignments, unresolved
+        return [], [n.item_id for n in needs]
 
-    need_texts = [n.text for n in remaining_needs]
+    need_texts = [n.text for n in needs]
     target_texts = [t[3] for t in targets]
     combined_vecs = embed_texts(need_texts + target_texts)
     need_vecs = combined_vecs[: len(need_texts)]
@@ -340,12 +318,26 @@ def compute_match_assignments(
 
     threshold = _min_match_sim()
 
+    # declared 후보 grounding 판단 + 보너스 적용 (임베딩 기반, v6)
+    for j in sorted(declared_target_idx):
+        tagent = declared_target_agent[j]
+        agent_need_rows = [i for i, n in enumerate(needs) if n.agent_id == tagent]
+        grounded = any(float(sim[i, j]) >= threshold for i in agent_need_rows)
+        step_id = targets[j][4]
+        provide_agent = targets[j][2]
+        if grounded:
+            for i in agent_need_rows:
+                sim[i, j] = min(1.0, float(sim[i, j]) + DECLARED_BID_BONUS)
+            print(f"  [DECLARE] step{step_id} ({provide_agent}\u2192{tagent}): "
+                  f"'{targets[j][3]}' \uadfc\uac70 \uc788\uc74c \u2192 bid +{DECLARED_BID_BONUS} \ubcf4\ub108\uc2a4")
+        else:
+            print(f"  [DECLARE] step{step_id} ({provide_agent}\u2192{tagent}): "
+                  f"'{targets[j][3]}' \uadfc\uac70 \uc5c6\uc74c \u2192 \ubcf4\ub108\uc2a4 \uc5c6\uc774 \ub2e4\ub978 \ud6c4\ubcf4\uc640 \ub3d9\ub4f1 \uacbd\uc7c1")
+
     valid_bidders: Dict[int, List[int]] = defaultdict(list)
-    for j, (tkind, tid, tagent, ttext) in enumerate(targets):
-        for i, n in enumerate(remaining_needs):
+    for j, (tkind, tid, tagent, ttext, decl_sid) in enumerate(targets):
+        for i, n in enumerate(needs):
             if tagent == n.agent_id:
-                continue
-            if (tagent, n.agent_id) in declared_pairs:
                 continue
             if float(sim[i, j]) < threshold:
                 continue
@@ -355,14 +347,14 @@ def compute_match_assignments(
                holder_score: float, holder_idx: int) -> bool:
         if challenger_score != holder_score:
             return challenger_score > holder_score
-        return remaining_needs[challenger_idx].item_id < remaining_needs[holder_idx].item_id
+        return needs[challenger_idx].item_id < needs[holder_idx].item_id
 
     current_winner: Dict[int, Tuple[int, float]] = {}
     matched: Set[int] = set()
 
     for _round in range(max_rounds):
         changed = False
-        order = sorted(range(len(remaining_needs)), key=lambda i: remaining_needs[i].item_id)
+        order = sorted(range(len(needs)), key=lambda i: needs[i].item_id)
         for i in order:
             if i in matched:
                 continue
@@ -387,13 +379,15 @@ def compute_match_assignments(
         if not changed:
             break
 
+    assignments: List[MatchAssignment] = []
+    matched_need_ids: Set[str] = set()
     for j, (i, score) in current_winner.items():
-        n = remaining_needs[i]
-        tkind, tid, tagent, ttext = targets[j]
+        n = needs[i]
+        tkind, tid, tagent, ttext, decl_sid = targets[j]
         assignments.append(MatchAssignment(
             need_item_id=n.item_id, need_agent=n.agent_id, need_text=n.text,
             target_kind=tkind, target_id=tid, target_agent=tagent,
-            target_text=ttext, weight=score,
+            target_text=ttext, weight=score, source_step_id=decl_sid,
         ))
         matched_need_ids.add(n.item_id)
 
