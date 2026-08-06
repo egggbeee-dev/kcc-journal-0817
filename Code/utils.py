@@ -213,7 +213,6 @@ def compute_joint_uncertainty(joint: List[Any]) -> float:
     total, count = 0.0, 0
     for s in joint:
         u = float(s.get("uncertainty", 0.2))
-        # cross-agent dep 있으면 가중치
         has_cross = any(
             id_to_agent.get(d) and id_to_agent[d] != s.get("agent_id")
             for d in s.get("depends_on", [])
@@ -224,19 +223,72 @@ def compute_joint_uncertainty(joint: List[Any]) -> float:
     return round(total / count, 3) if count > 0 else 0.0
 
 
-# ── 출력 헬퍼 (verifier 제거 후 여기로 이동) ──────────────────────────────────
+# ── 출력 헬퍼 ──────────────────────────────────────────────────────────────────
+#
+# format_joint_plan v2 — 사람이 읽기 편하도록 개편:
+#   1. step_id(101, 201... agent별 offset 그대로 노출) 대신, 최종 위상순
+#      기준 1..N 순차 번호로 다시 매김. depends_on의 raw id도 화면에는
+#      노출하지 않고 "무엇 다음에" / "누구로부터 받음" 형태의 자연어로
+#      풀어 씀 — depends_on 자체(내부 step_id 기준 그래프 구조)는
+#      joint_plan 딕셔너리에는 그대로 남아 있어서 프로그램적으로는 계속
+#      쓸 수 있음, 이 함수는 "화면 출력"만 바꾼 것.
+#   2. PASS ↔ RECEIVE를 짝지어 보여줌: PASS 스텝엔 "→ 누구에게 전달",
+#      그 상대 RECEIVE 스텝엔 "← 누구로부터 수신 ("보낸 액션 원문")"을
+#      붙여서, 화면만 봐도 어느 PASS가 어느 RECEIVE와 짝인지 바로 보이게 함.
 
 def format_joint_plan(plan: List[Dict]) -> str:
-    """Joint plan을 읽기 좋은 형태로 출력."""
+    """Joint plan을 사람이 읽기 좋은 자연어 형태로 출력."""
     if not plan:
         return "  (empty)"
-    lines = []
+
+    by_id = {s["step_id"]: s for s in plan}
+    display_idx = {s["step_id"]: i + 1 for i, s in enumerate(plan)}
+    room_w = max((len(s.get("room", "")) for s in plan), default=8)
+    agent_w = max((len(s.get("agent_id", "")) for s in plan), default=10)
+
+    lines: List[str] = []
     for s in plan:
-        dep  = f" deps={s['depends_on']}" if s.get("depends_on") else ""
-        hoff = f" [{s['handoff_type']}→{s['target_agent']}]" if s.get("handoff_type") else ""
-        note = f" ({s['notes']})" if s.get("notes") else ""
-        lines.append(
-            f"  {s['step_id']:>2}. [T={s['time_min']:>2}m] [{s['room']:<12}] [{s['agent_id']}]  "
-            f"{s['action']}{hoff}{dep}{note}"
+        idx = display_idx[s["step_id"]]
+        agent = s.get("agent_id", "")
+        room = s.get("room", "")
+        action = s.get("action", "")
+
+        deps = s.get("depends_on") or []
+        same_agent_deps = []
+        cross_agent_deps = []
+        for d in deps:
+            dep_step = by_id.get(d)
+            if dep_step is None:
+                continue
+            if dep_step.get("agent_id") == agent:
+                same_agent_deps.append(dep_step)
+            else:
+                cross_agent_deps.append(dep_step)
+
+        tags: List[str] = []
+
+        # 같은 agent 안의 순차 의존성 — "'X' 다음"
+        if same_agent_deps:
+            names = ", ".join(f"'{d['action']}'" for d in same_agent_deps)
+            tags.append(f"({names} 다음)")
+
+        # 다른 agent로부터 받는 경우 — RECEIVE 짝 표시
+        for d in cross_agent_deps:
+            tags.append(f"← {d.get('agent_id','?')}로부터 수신 (\"{d.get('action','')}\")")
+
+        # 이 스텝이 PASS로 보내는 경우 — 전달 방향 표시
+        if s.get("handoff_type") == "PASS" and s.get("target_agent"):
+            tags.append(f"→ {s['target_agent']}에게 전달")
+
+        note = (s.get("notes") or "").strip()
+        if note and "auto-inserted" not in note:
+            tags.append(f"«{note}»")
+
+        header = (
+            f"  {idx:>2}. [T={s.get('time_min', 0):>2}m] "
+            f"[{room:<{room_w}}] [{agent:<{agent_w}}]  {action}"
         )
+        line = header if not tags else header + "   " + "  ".join(tags)
+        lines.append(line)
+
     return "\n".join(lines)
