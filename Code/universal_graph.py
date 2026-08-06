@@ -76,8 +76,9 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-from config import FUZZY_STOPWORDS
+from config import FUZZY_STOPWORDS, PASS_SEND_VERBS
 from models import ConflictEntry, ConflictType, LocalPlan, Offer, PlanStep
+from offer import _kw  # offer.py와 동일한 스테밍 규칙 재사용 (towel/towels 등)
 from utils import format_joint_plan
 
 
@@ -211,8 +212,10 @@ def room_distance(
     return 1
 
 
-def _kw(text: str) -> Set[str]:
-    return set(re.findall(r"\w+", (text or "").lower())) - FUZZY_STOPWORDS
+# _kw는 이제 offer.py에서 import — 이 파일 안에서 따로 정의하지 않음
+# (v5까지는 이 파일에 스테밍 없는 _kw가 따로 있었고, offer.py의 _kw는
+# 스테밍이 있어서 'towel' vs 'towels'처럼 단복수만 다른 텍스트가
+# 두 파일에서 서로 다르게 취급되는 잠재 버그가 있었음. 하나로 통일함.
 
 
 def apply_declared_handoffs(
@@ -403,7 +406,8 @@ def compute_match_assignments(
 # ══════════════════════════════════════════════════════════════════════════════
 
 _RECEIVE_VERBS = {"receive", "get", "take", "pick", "accept"}
-_SEND_VERBS    = {"carry", "bring", "deliver", "transport", "pass"}
+_SEND_VERBS    = PASS_SEND_VERBS  # config.py의 단일 소스 — localplan.py의
+                                  # _normalize_pass 검증과 반드시 같은 목록이어야 함
 
 
 def _find_step_by_verb(plan: LocalPlan, item_text: str, verbs: Set[str]) -> Optional[PlanStep]:
