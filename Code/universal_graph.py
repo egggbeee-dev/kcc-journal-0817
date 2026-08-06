@@ -1,4 +1,4 @@
-# universal_graph.py  (v4 — embedding + CBAA-style auction matching (P2P) + verify/resolve conflict check)
+# universal_graph.py  (v5 — CBAA auction + need-grounded declared PASS + orphan cleanup)
 #
 # 2안: Universal Graph — 전체 노드를 다 올리고, 매칭 + 컨플릭트를 그래프
 # 자료구조 위에서 처리한다. 필터링(협업 무관 agent 제외) 없음. LLM 호출 없음.
@@ -17,76 +17,53 @@
 #     - DEPENDS_ON  : 같은 agent 안(원래) + STATE_DEPENDENCY로 추가되는
 #                     cross-agent 순서 제약
 #
-#   설계 원칙 (v4) — "전역성"과 "판단(reasoning)"을 분리한다:
+#   설계 원칙 — "전역성"과 "판단(reasoning)"을 분리한다:
 #     본 시스템의 각 단계는 (a) 전역 정보가 필요한가, (b) 그 자리에서 뭔가를
-#     "판단"하는가라는 두 축으로 분류된다. 이 둘은 서로 독립적이다 —
-#     전역 정보가 필요하다고 해서 반드시 판단(=LLM 호출/최적화)이 있는 건
-#     아니고, 판단이 있다고 해서 반드시 전역 정보가 필요한 것도 아니다.
+#     "판단"하는가라는 두 축으로 분류된다. 이 둘은 서로 독립적이다.
 #
 #       매칭(Auction)         : 로컬(전역 정보 불필요) + 판단 있음(bid 비교)
 #                                → 완전 decentralized
-#       Conflict Detection    : 전역(SAME_ROOM 엣지 순회 필요) + 판단 없음
-#                                (겹치는지 "확인"만 함, "verify")
-#       Conflict Resolution   : 로컬(영향받은 노드만) + 판단 있음
-#                                (사전 정의된 고정 규칙 적용, "rule-based
-#                                resolve" — LLM 없음, 매번 같은 입력엔
-#                                같은 출력)
-#       Kahn's Cycle Check    : 전역(그래프 전체를 봐야 사이클 유무를 앎)
-#                                + 판단 없음 ("verify")
-#       Kahn's Cycle Break    : 로컬(끊을 엣지 하나만 선택) + 판단 있음
-#                                (cross-agent 엣지 우선이라는 고정 규칙,
-#                                "rule-based resolve")
+#       Conflict Detection    : 전역(SAME_ROOM 엣지 순회 필요) + 판단 없음(verify)
+#       Conflict Resolution   : 로컬(영향받은 노드만) + 판단 있음(rule-based resolve)
+#       Kahn's Cycle Check    : 전역(그래프 전체를 봐야 사이클 유무를 앎) + 판단 없음(verify)
+#       Kahn's Cycle Break    : 로컬(끊을 엣지 하나만 선택) + 판단 있음(rule-based resolve)
 #
 #     즉 이 시스템에서 "전역 정보가 필요한 지점"(verify)에는 판단이 없고,
-#     "판단이 일어나는 지점"(resolve)은 전역 정보가 필요 없다 — 대부분의
-#     중앙집중형 시스템이 "전역 정보를 보고 + 그 자리에서 판단"을 같이
-#     하는 것과 근본적으로 다른 구조. 전역 verify는 순수 확인이라 값싸고
-#     (엣지 순회 기준 비용, 전체 재스캔 아님), 판단은 전부 로컬 + 결정론적
-#     규칙이라 예측 가능하고 감사 가능함.
+#     "판단이 일어나는 지점"(resolve)은 전역 정보가 필요 없다.
 #
 #   알고리즘:
-#     - 매칭(v4, CBAA 스타일 auction): 이전 버전(node-centric greedy)은
-#       "먼저 처리된 need가 임자"라는 처리 순서(리스트 인덱스)가 승자를
-#       결정했음 — 이건 "전체를 보는 계산 주체가 없다"는 P2P 요건과 미묘하게
-#       어긋남(순서 자체가 암묵적인 전역 중재자 역할을 했기 때문). v4는
-#       승자를 순서가 아니라 bid 값(임베딩 유사도)으로 결정한다. 모든
-#       need-agent는 이미 broadcast를 통해 동일한 정보(offer, plan, 임베딩
-#       유사도 행렬)를 갖고 있고 — 이것 자체는 유지한다, "정보 공유"를 막을
-#       필요는 없고 "판단 주체"만 분산되면 된다 — 이 공통 정보 위에서 각
-#       need가 스스로 bid를 계산하고, 매 라운드 "자기가 이길 수 있는 가장
-#       좋은 target"에 도전한다. 기존 낙찰자보다 bid가 높으면 낙찰자를
-#       교체하고(밀려난 need는 다음 라운드에 재도전), 동률이면 item_id
-#       사전순으로 고정 tie-break한다 — 이래야 "누가 언제 계산하든 같은
-#       결론"에 도달하고(consensus), 특정 프로세스가 중재자로서 순서를
-#       정하지 않는다. 이 루프는 코드 상 하나의 함수로 구현되어 있지만,
-#       개념적으로는 각 need-agent가 독립적으로 수행하는 로컬 판단을
-#       시뮬레이션한 것이다 — CBAA 원 논문(Choi, Brunet, How, 2009,
-#       IEEE T-RO)처럼 실제 분산 환경에서는 각 agent가 이 루프의 자기
-#       지분만 수행하고 "현재 낙찰 현황" 메시지만 주고받으면 됨. 전역
-#       최적해는 보장하지 않는다(트레이드오프로 감수, greedy auction의
-#       일반적 특성).
+#     - 매칭(CBAA 스타일 auction): 승자는 처리 순서가 아니라 bid 값(임베딩
+#       유사도)으로 결정. 동률이면 item_id 사전순 고정 tie-break. 모든
+#       need-agent가 broadcast된 공통 정보 위에서 로컬로 판단하는 걸
+#       시뮬레이션 (CBAA, Choi/Brunet/How 2009, IEEE T-RO).
+#     - declared PASS (v5, 신규): Local Plan에서 LLM이 스스로 만든 PASS
+#       선언은 "이미 확정된 의도"로 auction보다 우선 신뢰해왔는데, 실측
+#       결과 이 의도가 실제 need_from_other와 아무 근거 없이 만들어지는
+#       경우가 있었음 (예: 아무도 요청 안 한 laptop을 스스로 handoff).
+#       persona가 "능동적으로 도와라"를 지시하므로 이런 제안 자체를 막지는
+#       않되, target agent의 need_from_other와 키워드가 전혀 안 겹치면
+#       최우선 신뢰(=auction 생략) 자격을 박탈하고 그냥 auction 후보로
+#       강등한다. 근거가 있으면 그대로 최우선 통과.
+#     - orphan PASS 정리 (v5, 신규): declared든 auction매칭이든, 결국
+#       아무도 받지 않은(어떤 스텝의 depends_on에도 안 걸린) PASS 스텝은
+#       화면에 "→ 어딘가로 전달"만 뜨고 실제 수신자가 없어 혼란을 주므로,
+#       매칭 단계가 끝난 뒤 handoff_type을 제거해 평범한 스텝으로 되돌림.
 #     - Conflict: SAME_ROOM 엣지를 미리 만들어두고, 그 엣지를 순회하며
-#       "확인"만 한다(verify, 판단 없음). 문제가 확인되면 사전 정의된 고정
-#       규칙으로 해소한다(resolve, 로컬 — 영향받은 노드의 이웃 엣지만
-#       재확인, 1-hop 전파).
+#       "확인"만 한다(verify). 문제가 확인되면 사전 정의된 고정 규칙으로
+#       해소한다(resolve, 로컬 — 영향받은 노드의 이웃 엣지만 재확인).
 #     - Merge: Kahn's algorithm. 사이클 유무 확인은 전역(verify)이지만,
-#       사이클 발견 시 "어떤 엣지를 끊을지"는 cross-agent 엣지 우선이라는
+#       사이클 발견 시 어떤 엣지를 끊을지는 cross-agent 엣지 우선이라는
 #       고정 규칙(resolve, 로컬)으로 결정 — LLM 개입 없음.
 #
 # 설계 원칙: 텍스트 임베딩(사전학습 모델, 로컬 계산)만 사용. LLM 호출 없음.
-#           sentence-transformers가 없으면 TF-IDF 코사인 유사도로 자동 대체
-#           (약한 대체재 — 실제 의미 유사도 포착력은 sentence-transformers보다
-#           떨어짐. Colab 등 인터넷 되는 환경에서는 sentence-transformers 설치
-#           권장: `pip install sentence-transformers`).
+#           sentence-transformers가 없으면 TF-IDF 코사인 유사도로 자동 대체.
 #
-# P2P 정리: 관찰/Offer/Local Plan + 이 매칭 단계(v4: auction)는 완전
-#           분산(P2P) — 계산 주체가 항상 "그 need를 가진 agent 자신"이고,
-#           승자 결정도 순서가 아니라 bid consensus로 이루어짐(중앙
-#           중재자 없음). Conflict/Kahn's의 "verify" 단계만 전역 정보가
-#           필요하지만 이건 판단이 아니라 확인이고, "resolve" 단계는
-#           판단이지만 전역 정보 없이 로컬 + 고정 규칙으로 이루어짐
-#           (완전 P2P는 아니고, 판단이 필요한 곳엔 전역성이 없고 전역성이
-#           필요한 곳엔 판단이 없는 하이브리드 구조).
+# P2P 정리: 관찰/Offer/Local Plan + 매칭(auction)은 완전 분산(P2P) — 계산
+#           주체가 항상 "그 need를 가진 agent 자신"이고, 승자 결정도 순서가
+#           아니라 bid consensus로 이루어짐(중앙 중재자 없음). Conflict/
+#           Kahn's의 "verify" 단계만 전역 정보가 필요하지만 이건 판단이
+#           아니라 확인이고, "resolve" 단계는 판단이지만 전역 정보 없이
+#           로컬 + 고정 규칙으로 이루어짐.
 
 from __future__ import annotations
 
@@ -207,12 +184,11 @@ def build_item_nodes(offers: Dict[str, Offer]) -> List[ItemNode]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MATCH 후보 그래프 + CBAA 스타일 auction 매칭 (P2P, v4)
+# MATCH 후보 그래프 + CBAA 스타일 auction 매칭 (P2P)
 # ══════════════════════════════════════════════════════════════════════════════
 
 MIN_MATCH_SIM_ST    = 0.35   # sentence-transformers 사용 시 (코사인 유사도 스케일이 큼)
-MIN_MATCH_SIM_TFIDF = 0.05   # TF-IDF 폴백 시 (실측 결과 관련 있는 쌍도 0.08~0.11 수준이라
-                              # 낮게 잡음. 무관한 쌍은 0.000으로 명확히 구분됨)
+MIN_MATCH_SIM_TFIDF = 0.05   # TF-IDF 폴백 시
 ROOM_DIST_PENALTY = 0.02
 DEFAULT_AUCTION_ROUNDS = 5   # CBAA 수렴 상한 — 이론적으로 수렴 보장되지만
                               # threshold 근처 값들의 진동에 대한 안전장치
@@ -235,23 +211,52 @@ def room_distance(
     return 1
 
 
+def _kw(text: str) -> Set[str]:
+    return set(re.findall(r"\w+", (text or "").lower())) - FUZZY_STOPWORDS
+
+
 def apply_declared_handoffs(
     plans: Dict[str, LocalPlan],
+    offers: Optional[Dict[str, Offer]] = None,
 ) -> List[MatchAssignment]:
     """
     1단계 — Local Plan 생성 단계에서 LLM이 이미 명시적으로 정한 PASS 타겟
     (handoff_type="PASS" + target_agent 확정)을 auction보다 먼저 신뢰한다.
-    이걸 무시하고 auction을 처음부터 다시 돌리면, 이미 정해진 의도를
-    엉뚱한 agent한테 재배정해버리는 문제가 생길 수 있음 (실측으로 확인됨).
-    이 우선순위 계층 자체가 (auction+graph 조합 자체보다) 본 시스템의
-    핵심 차별점 — LLM이 스스로 정한 선언적 의도를 auction이 뒤엎지 않도록
-    보호함.
+
+    v5 — need 근거 검증 추가. persona가 "능동적으로 도와라"를 지시하다 보니
+    LLM이 target agent의 need_from_other와 무관한 아이템을 스스로 만들어
+    PASS로 선언하는 경우가 실측으로 확인됨 (예: 아무도 요청 안 한 laptop을
+    bedroom이 living_room에 handoff). 이런 "근거 없는 선의"까지 최우선
+    신뢰(=auction 검증 생략)를 주는 건 need_from_other 기반 협업 프로토콜
+    자체를 우회하는 뒷문이 되므로, target agent의 need_from_other와 키워드가
+    전혀 안 겹치면 declared 목록에서 제외하고 auction 후보로 강등한다
+    (완전 차단은 아님 — 정말 누군가의 need와 의미적으로 맞아떨어지면
+    auction에서 다시 매칭될 수 있음. 안 맞으면 그냥 매칭 안 되고 끝남).
+    offers가 주어지지 않으면(구버전 호환) 검증 없이 기존처럼 전부 신뢰.
     """
     declared: List[MatchAssignment] = []
+    offers = offers or {}
+
     for agent_id, plan in plans.items():
         for s in plan.steps:
             if s.handoff_type == "PASS" and s.target_agent and s.target_agent in plans:
                 item_text = s.action
+                target_offer = offers.get(s.target_agent)
+
+                if target_offer is not None:
+                    item_kw = _kw(item_text)
+                    need_kw: Set[str] = set()
+                    for n in target_offer.need_from_other:
+                        need_kw |= _kw(n)
+                    if item_kw and need_kw and not (item_kw & need_kw):
+                        print(
+                            f"  [DECLARE] step{s.step_id} ({agent_id}→{s.target_agent}) "
+                            f"PASS 강등: '{item_text}'가 {s.target_agent}의 "
+                            f"need_from_other={target_offer.need_from_other}와 근거 없음 "
+                            f"→ auction 후보로 넘김 (최우선 신뢰 박탈)"
+                        )
+                        continue  # declared에 안 넣음 — auction이 알아서 판단
+
                 declared.append(MatchAssignment(
                     need_item_id=f"__declared__{s.step_id}",
                     need_agent=s.target_agent,
@@ -260,7 +265,7 @@ def apply_declared_handoffs(
                     target_id=f"__declared__{s.step_id}",
                     target_agent=agent_id,
                     target_text=item_text,
-                    weight=1.0,  # 로컬 플랜에서 이미 확정된 것이므로 최고 신뢰도
+                    weight=1.0,  # need 근거 확인됨(또는 검증 불가) → 최고 신뢰도
                     source_step_id=s.step_id,
                 ))
     return declared
@@ -281,40 +286,24 @@ def compute_match_assignments(
     """
     NEED × (PROVIDE 아이템 ∪ 다른 agent의 Step) 매칭.
 
-    v4 — CBAA(Consensus-Based Auction Algorithm) 스타일 auction으로 전환.
-    이전 버전(node-centric greedy, v3)은 "먼저 처리된 need가 임자"라는
-    처리 순서(리스트 인덱스)가 승자를 결정했음 — 이건 "전체를 보는 계산
-    주체가 없다"는 P2P 요건과 미묘하게 어긋남(순서 자체가 암묵적인 전역
-    중재자 역할을 했기 때문). v4는 승자를 순서가 아니라 bid 값으로
-    결정한다:
+    CBAA(Consensus-Based Auction Algorithm) 스타일 auction: 승자는 처리
+    순서가 아니라 bid 값(임베딩 유사도)으로 결정된다. 모든 need-agent는
+    이미 broadcast를 통해 동일한 정보를 갖고 있고, 이 공통 정보 위에서
+    각 need가 스스로 bid를 계산해 매 라운드 "자기가 이길 수 있는 가장
+    좋은 target"에 도전한다. 기존 낙찰자보다 bid가 높으면 교체되고
+    (밀려난 need는 다음 라운드에 재도전), 동률이면 item_id 사전순으로
+    고정 tie-break — 어느 need-agent가 계산해도 같은 결론에 도달한다
+    (consensus, 중앙 중재자 없음).
 
-      - 모든 need-agent는 이미 broadcast를 통해 동일한 정보(offer, plan,
-        임베딩 유사도)를 갖고 있음 — 정보 공유 자체는 그대로 유지한다
-        ("판단 주체"만 분산되면 되고, 정보 공유를 막을 필요는 없음).
-      - 각 need는 이 공통 정보 위에서 "내가 이 target을 얼마나 원하는가"
-        (bid = 임베딩 유사도)를 스스로 계산.
-      - 라운드마다 각 need가 "자기가 이길 수 있는 가장 좋은 target"에
-        도전하고, 기존 낙찰자보다 bid가 높으면 낙찰자를 교체한다(밀려난
-        need는 다음 라운드에 재도전). 동률이면 item_id 사전순으로 고정
-        tie-break — 이래야 "누가 언제 계산하든 같은 결론"에 도달하고
-        (consensus), 특정 프로세스가 중재자로서 순서를 정하지 않는다.
-      - 수렴할 때까지(또는 max_rounds) 반복. 이 루프는 코드 상 하나의
-        함수로 구현되어 있지만, 개념적으로는 각 need-agent가 독립적으로
-        수행하는 로컬 판단을 시뮬레이션한 것 — 실제 분산 환경에서는
-        각 agent가 이 루프의 자기 지분만 수행하고 "현재 낙찰 현황"
-        메시지만 주고받으면 됨 (CBAA 원 논문, Choi, Brunet, How, 2009,
-        IEEE T-RO).
+    Local Plan에서 이미 명시적으로 확정된 PASS(target_agent 포함) 중
+    need_from_other로 근거가 확인된 것은 apply_declared_handoffs에서
+    먼저 신뢰하고, 그 agent 쌍은 이 단계에서 건드리지 않는다. 근거 없이
+    강등된 PASS는 여기서 다른 PROVIDE/STEP 후보와 동등하게 경쟁한다.
 
-    Local Plan에서 이미 명시적으로 확정된 PASS(target_agent 포함)는
-    1단계(apply_declared_handoffs)에서 먼저 신뢰하고, 그 agent 쌍은
-    이 단계에서 건드리지 않는다.
-
-    반환: (확정된 MatchAssignment 리스트 — 선언분+auction매칭분, 매칭 안 된 need_item_id 리스트)
+    반환: (확정된 MatchAssignment 리스트, 매칭 안 된 need_item_id 리스트)
     """
-    declared = apply_declared_handoffs(plans)
+    declared = apply_declared_handoffs(plans, offers)
     declared_pairs = _already_declared_agent_pairs(declared)
-    # 이미 선언된 handoff를 "받은" agent들 — 이 agent들의 실제 need는
-    # (텍스트 매칭 없이도) 그 handoff가 채워주는 것으로 간주해 매칭 완료 처리한다.
     agents_with_declared_incoming = {a.need_agent for a in declared}
 
     needs = [it for it in items if it.kind == "NEED"]
@@ -344,47 +333,32 @@ def compute_match_assignments(
     combined_vecs = embed_texts(need_texts + target_texts)
     need_vecs = combined_vecs[: len(need_texts)]
     target_vecs = combined_vecs[len(need_texts):]
-    # sim = "broadcast된 공통 정보" — 모든 need-agent가 동일하게 접근 가능한
-    # 값. 이 값 자체를 누가 계산했는지는 P2P 성격을 해치지 않는다 (Offer
-    # 텍스트 자체가 이미 broadcast되어 있으므로, 그 위에서 유사도를 로컬
-    # 재계산하는 것은 각 agent가 스스로 할 수 있는 연산).
-    sim = cosine_sim_matrix(need_vecs, target_vecs)
+    sim = cosine_sim_matrix(need_vecs, target_vecs)  # "broadcast된 공통 정보"
 
     threshold = _min_match_sim()
 
-    # 각 target(candidate)에 대해 threshold를 넘고, agent 제약(자기 자신 제외,
-    # 이미 declared된 쌍 제외)을 통과하는 valid bidder 목록을 미리 걸러둠
-    valid_bidders: Dict[int, List[int]] = defaultdict(list)  # target_idx -> [need_idx, ...]
+    valid_bidders: Dict[int, List[int]] = defaultdict(list)
     for j, (tkind, tid, tagent, ttext) in enumerate(targets):
         for i, n in enumerate(remaining_needs):
             if tagent == n.agent_id:
-                continue  # 자기 자신은 매칭 대상 아님
+                continue
             if (tagent, n.agent_id) in declared_pairs:
-                continue  # 이미 로컬 플랜에서 이 쌍끼리 확정됨
+                continue
             if float(sim[i, j]) < threshold:
                 continue
             valid_bidders[j].append(i)
 
     def _beats(challenger_score: float, challenger_idx: int,
                holder_score: float, holder_idx: int) -> bool:
-        """challenger가 현재 holder를 이기는가. 동률이면 item_id 사전순 —
-        어느 need-agent가 이 판단을 하든 항상 같은 결론에 도달함(consensus).
-        """
         if challenger_score != holder_score:
             return challenger_score > holder_score
         return remaining_needs[challenger_idx].item_id < remaining_needs[holder_idx].item_id
 
-    # current_winner: target_idx -> (need_idx, bid) — 이건 "현재 낙찰 현황"이지
-    # 중앙 중재자의 결정이 아님. 실제 분산 구현에서는 이게 각 target 후보를
-    # broadcast 채널에 올라온 최신 메시지로 대체됨.
     current_winner: Dict[int, Tuple[int, float]] = {}
-    matched: Set[int] = set()  # 현재 뭔가를 낙찰받은 need_idx
+    matched: Set[int] = set()
 
     for _round in range(max_rounds):
         changed = False
-        # need_idx 순회 순서도 item_id 사전순으로 고정 — 순서 자체가 결과에
-        # 영향을 주지 않도록 함 (v3의 "리스트 인덱스가 승자를 정한다"는
-        # 문제를 여기서도 재현하지 않기 위함)
         order = sorted(range(len(remaining_needs)), key=lambda i: remaining_needs[i].item_id)
         for i in order:
             if i in matched:
@@ -397,18 +371,18 @@ def compute_match_assignments(
                 score = float(sim[i, j])
                 holder = current_winner.get(j)
                 if holder is not None and not _beats(score, i, holder[1], holder[0]):
-                    continue  # 이 target은 이미 나보다 강한(또는 동률+선순위) bid가 있음
+                    continue
                 if score > best_score:
                     best_score, best_j = score, j
             if best_j is not None:
                 prev = current_winner.get(best_j)
                 if prev is not None:
-                    matched.discard(prev[0])  # 밀려난 need는 다음 라운드에 재도전
+                    matched.discard(prev[0])
                 current_winner[best_j] = (i, best_score)
                 matched.add(i)
                 changed = True
         if not changed:
-            break  # 수렴 — 더 이상 아무도 낙찰 현황을 바꾸지 못함
+            break
 
     for j, (i, score) in current_winner.items():
         n = remaining_needs[i]
@@ -426,23 +400,13 @@ def compute_match_assignments(
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 확정된 매칭을 실제 plans에 반영
-#   - PROVIDE 타겟 → HANDOFF (기존과 동일: 받는 스텝 자동 삽입 + 순서 조정)
-#   - STEP 타겟     → STATE_DEPENDENCY (cross-agent depends_on 엣지만 추가,
-#                     새 스텝은 만들지 않음 — 이미 존재하는 상태 변화이므로)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _RECEIVE_VERBS = {"receive", "get", "take", "pick", "accept"}
 _SEND_VERBS    = {"carry", "bring", "deliver", "transport", "pass"}
 
 
-def _kw(text: str) -> Set[str]:
-    return set(re.findall(r"\w+", (text or "").lower())) - FUZZY_STOPWORDS
-
-
 def _find_step_by_verb(plan: LocalPlan, item_text: str, verbs: Set[str]) -> Optional[PlanStep]:
-    # 원문 그대로 비교하면 "carry X to kitchen doorway for Y pickup" 같은
-    # 상투적 문구(kitchen/doorway/pickup 등)가 겹쳐서 서로 다른 아이템끼리
-    # 오매칭될 수 있음 — 동사/목적지 문구를 걷어낸 순수 아이템명으로 비교
     item_kw = _kw(_clean_item_phrase(item_text))
     for s in plan.steps:
         first = s.action.lower().split()[0] if s.action.strip() else ""
@@ -452,7 +416,6 @@ def _find_step_by_verb(plan: LocalPlan, item_text: str, verbs: Set[str]) -> Opti
 
 
 def _find_consuming_step(plan: LocalPlan, need_text: str, exclude_ids: Set[int]) -> Optional[PlanStep]:
-    """need 텍스트 키워드와 겹치는, 아직 처리 안 된 스텝을 찾음 (상태 의존성용)."""
     need_kw = _kw(need_text)
     for s in plan.steps:
         if s.step_id in exclude_ids:
@@ -467,9 +430,6 @@ _DOORWAY_SUFFIX_RE = re.compile(r"\s+(to|for)\s+.*(doorway|pickup|delivery).*$",
 
 
 def _clean_item_phrase(text: str) -> str:
-    """PASS 액션 문장('bring laptop to doorway')에서 동사/목적지 문구를 제거해
-    깔끔한 아이템 설명('laptop')만 남김. 이미 깔끔한 텍스트(Offer의 can_provide
-    항목 등)는 그대로 통과."""
     t = _SEND_VERB_PREFIX_RE.sub("", text)
     t = _DOORWAY_SUFFIX_RE.sub("", t)
     return t.strip() or text
@@ -482,12 +442,6 @@ def _propagate_time_forward(
     affected: Set[int],
     _visited: Optional[Set[int]] = None,
 ) -> None:
-    """
-    step_id의 시각을 min_time 이상으로 밀고, 그 스텝에 의존하는(depends_on에
-    포함하는) 다른 모든 스텝(agent 무관)도 필요하면 연쇄적으로 뒤로 민다.
-    한 곳만 밀고 끝나면 그 뒤에 매달린 스텝들이 시간상 모순되게 남을 수 있어서
-    (예: PASS 스텝이 그 준비 스텝보다 먼저인 채로 남는 경우) 이 전파가 필요함.
-    """
     if _visited is None:
         _visited = set()
     if step_id in _visited:
@@ -510,13 +464,6 @@ def _propagate_time_forward(
 
 
 def _outgoing_chain_step_ids(plan: LocalPlan) -> Set[int]:
-    """
-    이 plan 안에서 PASS 스텝 자신 + 그 PASS로 이어지는 depends_on 조상들의
-    step_id 집합. 예: prep(A) -> prep(B) -> PASS(C)면 {A,B,C} 전부 포함.
-    이 집합에 속한 스텝은 "받은 아이템을 쓰는 스텝"으로 취급하면 안 됨 —
-    얘네는 (같은 이름이라도 다른 물건일 수 있는) 자기 아이템을 내보내는
-    파이프라인이지, 받은 걸 소비하는 스텝이 아니기 때문.
-    """
     by_id = {s.step_id: s for s in plan.steps}
     result: Set[int] = set()
 
@@ -542,8 +489,6 @@ def apply_handoff(
     affected: Set[int] = set()
 
     if a.source_step_id is not None:
-        # 선언된(declared) handoff — Local Plan에서 이미 정확히 어떤 스텝인지
-        # 알고 있으므로 키워드 검색 없이 그 스텝을 바로 사용
         send_step = next((s for s in provide_plan.steps if s.step_id == a.source_step_id), None)
     else:
         send_step = _find_step_by_verb(provide_plan, a.target_text, _SEND_VERBS)
@@ -565,7 +510,7 @@ def apply_handoff(
             room=need_plan.steps[0].room if need_plan.steps else "",
             agent_id=a.need_agent,
             action=f"receive {clean_item}",
-            depends_on=[send_step.step_id],  # 보내는 스텝보다 반드시 뒤에 오도록 강제
+            depends_on=[send_step.step_id],
             handoff_type=None,
             target_agent=None,
             uncertainty=0.2,
@@ -575,18 +520,12 @@ def apply_handoff(
         need_plan.steps.sort(key=lambda s: (s.time_min, s.step_id))
         affected.add(new_id)
 
-    # recv_step이 새로 만들어졌든(위에서 depends_on 지정) LLM이 이미 만들어뒀던 것이든,
-    # 반드시 send_step보다 뒤에 오도록 의존성을 강제한다 (여기서 한 번 더 보장).
     if send_step.step_id not in recv_step.depends_on:
         recv_step.depends_on = list(recv_step.depends_on) + [send_step.step_id]
         affected.add(recv_step.step_id)
     if recv_step.time_min <= send_step.time_min:
         _propagate_time_forward(plans, recv_step.step_id, send_step.time_min + 2, affected)
 
-    # 이 아이템을 실제로 쓰는 다른 스텝이 받기 전에 와 있으면 순서 재조정
-    # (그 스텝에 의존하는 후속 스텝들까지 연쇄적으로 전파)
-    # target_text 원문이 아니라 정제된 아이템명으로 비교 — "kitchen doorway for
-    # Y pickup" 같은 상투적 문구가 겹쳐서 다른 아이템끼리 오매칭되는 걸 방지
     item_kw = _kw(_clean_item_phrase(a.target_text))
     outgoing_ids = _outgoing_chain_step_ids(need_plan)
     for s in need_plan.steps:
@@ -596,9 +535,6 @@ def apply_handoff(
         if first in _RECEIVE_VERBS:
             continue
         if s.step_id in outgoing_ids:
-            # 이 스텝은 (자신이 PASS든, PASS로 이어지는 준비 단계든) 뭔가를
-            # 내보내는 파이프라인 소속 — 이름이 같아도 다른 물건일 수 있으므로
-            # "받은 아이템을 쓰는 스텝"으로 강제 순서 조정하지 않음
             continue
         if item_kw & _kw(s.action) and s.time_min <= recv_step.time_min:
             if recv_step.step_id not in s.depends_on:
@@ -612,11 +548,6 @@ def apply_handoff(
 def apply_state_dependency(
     a: MatchAssignment, plans: Dict[str, LocalPlan],
 ) -> Set[int]:
-    """
-    STEP 타겟 매칭 → 새 스텝을 만들지 않고, need-agent의 소비 스텝을
-    provide-step 이후로 오도록 cross-agent DEPENDS_ON 엣지만 추가.
-    (Kahn's algorithm은 agent 구분 없이 depends_on을 그대로 다루므로 안전)
-    """
     need_plan = plans[a.need_agent]
     provide_step_id = int(a.target_id)
     provide_step = next(
@@ -628,7 +559,7 @@ def apply_state_dependency(
     consumer = _find_consuming_step(need_plan, a.need_text, exclude_ids=set())
     affected: Set[int] = set()
     if consumer is None:
-        return affected  # 소비 스텝을 못 찾으면 순서 강제할 대상이 없음 — 정보만 기록
+        return affected
 
     if provide_step.step_id not in consumer.depends_on:
         consumer.depends_on = list(consumer.depends_on) + [provide_step.step_id]
@@ -637,6 +568,33 @@ def apply_state_dependency(
         _propagate_time_forward(plans, consumer.step_id, provide_step.time_min + 1, affected)
 
     return affected
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# orphan PASS 정리 (v5, 신규) — 아무도 안 받은 PASS는 평범한 스텝으로 되돌림
+# ══════════════════════════════════════════════════════════════════════════════
+
+def cleanup_orphan_pass(plans: Dict[str, LocalPlan]) -> List[int]:
+    """
+    declared든 auction매칭이든, 결국 어떤 스텝의 depends_on에도 참조되지
+    않은 PASS 스텝은 실제로는 아무도 받지 않은 것 — 화면에 "→ 어딘가로
+    전달"만 뜨고 대응하는 RECEIVE가 없어 혼란을 준다. 매칭 단계가 모두
+    끝난 뒤, 그런 PASS는 handoff_type/target_agent를 지워 평범한 준비
+    스텝으로 되돌린다.
+    반환: 정리된 step_id 리스트.
+    """
+    all_steps = [s for p in plans.values() for s in p.steps]
+    referenced: Set[int] = set()
+    for s in all_steps:
+        referenced.update(s.depends_on)
+
+    cleaned: List[int] = []
+    for s in all_steps:
+        if s.handoff_type == "PASS" and s.step_id not in referenced:
+            s.handoff_type = None
+            s.target_agent = None
+            cleaned.append(s.step_id)
+    return cleaned
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -664,12 +622,11 @@ def build_same_room_edges(plans: Dict[str, LocalPlan]) -> Dict[int, List[int]]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONFLICT 탐지 (global verify — 전역이지만 판단 없음, "확인"만 함)
-# SAME_ROOM 엣지를 순회 (전체 쌍 재계산 아님, 엣지 기준 비용)
+# CONFLICT 탐지 (global verify)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _TEMPORAL_WINDOW_MIN = 3
-REDUNDANCY_SIM_THRESH = 0.92  # 임베딩 유사도 기준 (LLM 아님)
+REDUNDANCY_SIM_THRESH = 0.92
 
 
 def detect_conflicts_via_edges(
@@ -678,13 +635,9 @@ def detect_conflicts_via_edges(
     same_room_edges: Dict[int, List[int]],
     only_step_ids: Optional[Set[int]] = None,
 ) -> List[ConflictEntry]:
-    """global verify 단계 — 겹치는지/충돌인지 "확인"만 함. 뭘 할지는
-    resolve_conflict(로컬 + 고정 규칙)에서 결정한다. 이 함수 자체는 판단을
-    내리지 않음 (판단 없는 전역 연산)."""
     all_steps = {s.step_id: s for p in plans.values() for s in p.steps}
     conflicts: List[ConflictEntry] = []
 
-    # ── (a) TEMPORAL + (c) REDUNDANCY : SAME_ROOM 엣지 순회 ──────────────────
     node_ids = only_step_ids if only_step_ids is not None else set(same_room_edges.keys())
     seen_pairs: Set[Tuple[int, int]] = set()
 
@@ -722,7 +675,6 @@ def detect_conflicts_via_edges(
                     f"remove step {later.step_id}",
                 ))
 
-    # ── (d) CANNOT_DO — 자기 혼자 체크 (엣지 불필요) ──────────────────────────
     for sid in (only_step_ids if only_step_ids is not None else all_steps.keys()):
         s = all_steps.get(sid)
         if s is None or "auto-inserted" in (s.notes or ""):
@@ -739,7 +691,6 @@ def detect_conflicts_via_edges(
                 ))
                 break
 
-    # ── (e) OBSERVABILITY — 자기 혼자 체크 (엣지 불필요) ──────────────────────
     for sid in (only_step_ids if only_step_ids is not None else all_steps.keys()):
         s = all_steps.get(sid)
         if s is None or s.handoff_type or "auto-inserted" in (s.notes or ""):
@@ -762,9 +713,6 @@ def detect_conflicts_via_edges(
 
 
 def resolve_conflict(conflict: ConflictEntry, plans: Dict[str, LocalPlan]) -> Set[int]:
-    """rule-based resolve 단계 — 전역 정보 불필요(영향받은 노드만 다룸),
-    판단은 있지만 사전 정의된 고정 규칙 적용(LLM 없음, 매번 같은 입력엔
-    같은 출력)."""
     affected: Set[int] = set()
 
     if conflict.conflict_type == ConflictType.TEMPORAL:
@@ -789,25 +737,10 @@ def resolve_conflict(conflict: ConflictEntry, plans: Dict[str, LocalPlan]) -> Se
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Kahn's Algorithm — 사이클 체크(global verify) + 위상 정렬/사이클 해소
-# (rule-based resolve: cross-agent 엣지 우선 절단)
+# Kahn's Algorithm
 # ══════════════════════════════════════════════════════════════════════════════
 
 def kahn_topological_order(plans: Dict[str, LocalPlan]) -> Tuple[List[int], bool, List[Tuple[int, int]]]:
-    """
-    위상 정렬 + 사이클 자동 해소.
-    사이클 유무 확인(in-degree=0 노드가 더 없는데 남은 스텝이 있는가)은
-    전역 정보가 필요한 verify — 그래프 전체를 봐야 사이클을 알 수 있다는
-    건 수학적으로 불가피함, 어떤 로컬 정보로도 우회 불가.
-    사이클이 감지되면, 남은 것 중 time_min이 가장 이른 스텝을 골라 그
-    스텝으로 들어오는 depends_on 엣지 하나를 끊는다 — 이건 resolve 단계로,
-    cross-agent 엣지(STATE_DEPENDENCY 추론으로 생긴 것)를 우선 끊는다는
-    고정 규칙이다(로컬 판단, 전역 정보 재확인 불필요). 같은 agent 안
-    엣지는 원래 Local Plan에서 LLM이 명시한 의도라서 더 신뢰할 수 있고,
-    cross-agent 엣지는 그래프 리즈닝이 사후에 추론한 것이라 끊어도
-    상대적으로 안전함.
-    반환: (정렬된 step_id 리스트, 사이클 없었는지 여부, 끊긴 엣지 리스트[(from,to)])
-    """
     all_steps = {s.step_id: s for p in plans.values() for s in p.steps}
     in_degree = {sid: 0 for sid in all_steps}
     adj: Dict[int, List[int]] = {sid: [] for sid in all_steps}
@@ -840,7 +773,6 @@ def kahn_topological_order(plans: Dict[str, LocalPlan]) -> Tuple[List[int], bool
         if not remaining:
             break
 
-        # 사이클 발생 — 남은 것 중 time_min이 가장 이른 스텝을 강제로 진입시킴
         stuck_id = min(remaining, key=lambda sid: all_steps[sid].time_min)
         stuck_step = all_steps[stuck_id]
         deps_in_remaining = [d for d in stuck_step.depends_on if d in remaining]
@@ -869,8 +801,6 @@ def merge_joint_plan(plans: Dict[str, LocalPlan]) -> Tuple[List[dict], List[Tupl
     if broken_edges:
         print(f"  [MERGE] 사이클 감지 → {len(broken_edges)}개 cross-agent 엣지 자동 해제: {broken_edges}")
 
-    # 사이클 해제 후에도 depends_on 기준으로 시간이 여전히 모순될 수 있어서,
-    # 최종 위상순을 따라가며 "의존 대상보다 반드시 뒤에 오도록" 한 번 더 정합성 보정
     for sid in order:
         s = all_steps[sid]
         for dep in s.depends_on:
@@ -905,13 +835,13 @@ def run(
     auction_rounds: int = DEFAULT_AUCTION_ROUNDS,
 ) -> dict:
     plans = copy.deepcopy(plans)
-    events: List[dict] = []  # 데모/시각화용 구조화된 이벤트 로그 (실제 실행 데이터)
+    events: List[dict] = []
 
     agent_ids = [getattr(a, "agent_id", a) for a in active_agents]
     for aid in agent_ids:
         events.append({"type": "node", "kind": "agent", "id": aid})
 
-    # ── 1) 매칭 (CBAA 스타일 auction, P2P — 로컬 + 판단, 전역 정보 불필요) ────
+    # ── 1) 매칭 (CBAA 스타일 auction, P2P) ────────────────────────────────────
     items = build_item_nodes(offers)
     for it in items:
         events.append({
@@ -958,7 +888,14 @@ def run(
     for nid in unresolved_needs:
         events.append({"type": "unresolved_need", "id": nid})
 
-    # ── 2) SAME_ROOM 엣지 구축 + Conflict 워크리스트 (global verify → rule-based resolve) ──
+    # ── 1.5) orphan PASS 정리 ──────────────────────────────────────────────────
+    cleaned = cleanup_orphan_pass(plans)
+    if cleaned:
+        print(f"  [CLEANUP] 수신자 없는 PASS {len(cleaned)}개 → 평범한 스텝으로 정리: {cleaned}")
+        for sid in cleaned:
+            events.append({"type": "orphan_pass_cleaned", "id": f"step_{sid}"})
+
+    # ── 2) SAME_ROOM 엣지 구축 + Conflict 워크리스트 ───────────────────────────
     same_room_edges = build_same_room_edges(plans)
     conflict_queue = deque(detect_conflicts_via_edges(plans, offers, same_room_edges))
     resolved: List[ConflictEntry] = []
@@ -973,7 +910,7 @@ def run(
             "step_ids": c.step_ids, "description": c.description,
         })
         if affected:
-            same_room_edges = build_same_room_edges(plans)  # 스텝 변경 반영해 재구축
+            same_room_edges = build_same_room_edges(plans)
             new_conflicts = detect_conflicts_via_edges(plans, offers, same_room_edges, only_step_ids=affected)
             for nc in new_conflicts:
                 if nc not in resolved:
@@ -981,7 +918,7 @@ def run(
 
     print(f"  [CONFLICT] {len(resolved)}개 자동 해결, {len(handoff_conflicts)}개 미해결(DEPENDENCY)")
 
-    # ── 3) Merge (Kahn's algorithm — global verify → rule-based resolve) ──────
+    # ── 3) Merge (Kahn's algorithm) ───────────────────────────────────────────
     joint_plan, broken_cycle_edges = merge_joint_plan(plans)
     for from_id, to_id in broken_cycle_edges:
         events.append({"type": "cycle_broken", "from": f"step_{from_id}", "to": f"step_{to_id}"})
@@ -999,7 +936,8 @@ def run(
             for nid in unresolved_needs
         ],
         "broken_cycle_edges": broken_cycle_edges,
+        "orphan_pass_cleaned": cleaned,
         "joint_plan": joint_plan,
         "joint_plan_text": format_joint_plan(joint_plan),
-        "graph_events": events,  # 데모/시각화(graph_demo.py)에서 그대로 사용
+        "graph_events": events,
     }
