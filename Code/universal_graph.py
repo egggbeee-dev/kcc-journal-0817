@@ -247,6 +247,96 @@ def _gather_declared_candidates(
     return out
 
 
+def _auction_phase(
+    need_idx: int,
+    sim: np.ndarray,
+    valid_bidders: Dict[int, List[int]],
+    current_winner: Dict[int, Tuple[int, float]],
+    needs: List[ItemNode],
+) -> Optional[Tuple[int, float]]:
+    """
+    경매 단계(Auction Phase) — GCAA(Braquet & Bakolas, 2021)의 2단계 구조를
+    본떠 명시적으로 분리함.
+
+    need_idx 하나만의 완전히 로컬인 연산: 유효하게 입찰 가능한 target들 중,
+    "직전 라운드까지 확정되어 공개된 낙찰 현황"(current_winner)을 기준으로
+    자신이 이길 수 있는(또는 아직 아무도 없는) target 중 bid가 가장 높은
+    것 하나를 "제안"으로 고른다.
+
+    current_winner를 참조하는 게 "로컬"이라는 원칙을 깨지 않는 이유:
+    이건 이번 라운드에 다른 need가 몰래 뭘 제안하는지 훔쳐보는 게 아니라,
+    이미 이전 라운드에 합의(consensus)되어 공개 broadcast된 정보를 읽는
+    것이다 — CBAA/GCAA 에이전트도 정확히 이렇게 동작한다: 매 라운드
+    "공개된 현재 낙찰 현황 대비 내가 이길 수 있는 가장 좋은 target"에
+    다시 도전한다. 이 스냅샷을 안 보면(초기 버전의 버그), 이길 수 없는
+    target에 영원히 재도전만 하다가 대안으로 못 넘어가는 문제가 생김
+    (실측으로 확인됨 — 아래 unit test 참고).
+    """
+    def _beats(challenger_score: float, challenger_idx: int,
+               holder_score: float, holder_idx: int) -> bool:
+        if challenger_score != holder_score:
+            return challenger_score > holder_score
+        return needs[challenger_idx].item_id < needs[holder_idx].item_id
+
+    best_j: Optional[int] = None
+    best_score = -1.0
+    for j, bidders in valid_bidders.items():
+        if need_idx not in bidders:
+            continue
+        score = float(sim[need_idx, j])
+        holder = current_winner.get(j)
+        if holder is not None and holder[0] != need_idx and not _beats(score, need_idx, holder[1], holder[0]):
+            continue  # 공개된 현재 낙찰자를 못 이기는 target은 제안 후보에서 제외
+        if score > best_score:
+            best_score, best_j = score, j
+    if best_j is None:
+        return None
+    return best_j, best_score
+
+
+def _consensus_phase(
+    proposals: Dict[int, Tuple[int, float]],
+    current_winner: Dict[int, Tuple[int, float]],
+    matched: Set[int],
+    needs: List[ItemNode],
+) -> bool:
+    """
+    합의 단계(Consensus Phase) — 이번 라운드에 모인 모든 제안(proposals)을
+    훑으며 승자를 확정한다.
+
+    승자 판정 규칙은 "bid 값이 더 높은가, 동률이면 item_id 사전순"뿐이라,
+    이 규칙 자체는 공개되어 있고 결정론적이다 — 그래서 어느 need-agent가
+    이 규칙을 스스로 적용해도(즉 이 함수를 각자 로컬로 돌려도) 항상 같은
+    결론에 도달한다. 특정 프로세스가 "중재자"로서 승패를 결정하는 게
+    아니라, 모두가 같은 공개 규칙 위에서 같은 답에 수렴하는 것 — 이게
+    "합의(consensus)"의 정확한 의미다. 참조 구현은 명료성을 위해 이걸
+    하나의 함수로 순차 처리하지만, 결과는 각 need-agent가 독립적으로
+    이 규칙을 적용한 것과 동일하다.
+
+    반환: 이번 라운드에 낙찰 현황이 하나라도 바뀌었는지 여부(수렴 판정용).
+    """
+    def _beats(challenger_score: float, challenger_idx: int,
+               holder_score: float, holder_idx: int) -> bool:
+        if challenger_score != holder_score:
+            return challenger_score > holder_score
+        return needs[challenger_idx].item_id < needs[holder_idx].item_id
+
+    changed = False
+    order = sorted(proposals.keys(), key=lambda i: needs[i].item_id)
+    for i in order:
+        target_j, score = proposals[i]
+        holder = current_winner.get(target_j)
+        if holder is not None and not _beats(score, i, holder[1], holder[0]):
+            continue
+        prev = current_winner.get(target_j)
+        if prev is not None:
+            matched.discard(prev[0])
+        current_winner[target_j] = (i, score)
+        matched.add(i)
+        changed = True
+    return changed
+
+
 def compute_match_assignments(
     items: List[ItemNode],
     plans: Dict[str, LocalPlan],
@@ -343,39 +433,27 @@ def compute_match_assignments(
                 continue
             valid_bidders[j].append(i)
 
-    def _beats(challenger_score: float, challenger_idx: int,
-               holder_score: float, holder_idx: int) -> bool:
-        if challenger_score != holder_score:
-            return challenger_score > holder_score
-        return needs[challenger_idx].item_id < needs[holder_idx].item_id
-
     current_winner: Dict[int, Tuple[int, float]] = {}
     matched: Set[int] = set()
 
     for _round in range(max_rounds):
-        changed = False
-        order = sorted(range(len(needs)), key=lambda i: needs[i].item_id)
-        for i in order:
+        # ── 경매 단계: 모든 미매칭 need가, 이번 라운드 시작 시점의 낙찰
+        #    현황만 보고, 서로 뭘 제안하는지 모른 채(동시에) 자기 제안을
+        #    계산한다 — 완전히 로컬인 연산 ─────────────────────────────────
+        proposals: Dict[int, Tuple[int, float]] = {}
+        for i in range(len(needs)):
             if i in matched:
                 continue
-            best_j: Optional[int] = None
-            best_score = -1.0
-            for j, bidders in valid_bidders.items():
-                if i not in bidders:
-                    continue
-                score = float(sim[i, j])
-                holder = current_winner.get(j)
-                if holder is not None and not _beats(score, i, holder[1], holder[0]):
-                    continue
-                if score > best_score:
-                    best_score, best_j = score, j
-            if best_j is not None:
-                prev = current_winner.get(best_j)
-                if prev is not None:
-                    matched.discard(prev[0])
-                current_winner[best_j] = (i, best_score)
-                matched.add(i)
-                changed = True
+            proposal = _auction_phase(i, sim, valid_bidders, current_winner, needs)
+            if proposal is not None:
+                proposals[i] = proposal
+
+        if not proposals:
+            break
+
+        # ── 합의 단계: 이번 라운드에 모인 제안들을 공개된 결정론적 규칙으로
+        #    한꺼번에 반영 → 승자 확정 (중재자 없음, 규칙만 있음) ─────────────
+        changed = _consensus_phase(proposals, current_winner, matched, needs)
         if not changed:
             break
 
@@ -478,10 +556,39 @@ def _outgoing_chain_step_ids(plan: LocalPlan) -> Set[int]:
     return result
 
 
+@dataclass
+class MissingReceive:
+    """4단계(Matching)에서 HANDOFF는 확정됐지만, 받는 쪽 로컬 플랜에 대응하는
+    receive 스텝이 아직 없는 경우를 나타내는 신호. 이 스텝을 실제로
+    만들어 삽입하는 건 apply_handoff(4단계, matching 결정)의 몫이 아니라
+    resolve_missing_receive(5단계, resolve — "insert step" 규칙)의 몫이다.
+    """
+    need_agent:    str
+    send_step_id:  int
+    target_text:   str
+
+
 def apply_handoff(
     a: MatchAssignment, plans: Dict[str, LocalPlan],
-) -> Tuple[Optional[ConflictEntry], Set[int]]:
-    """PROVIDE 타겟 매칭 → 기존 HANDOFF 로직 (받는 스텝 자동 삽입 + 순서 조정)."""
+) -> Tuple[Optional[ConflictEntry], Set[int], Optional["MissingReceive"]]:
+    """
+    PROVIDE 타겟 매칭 → HANDOFF 엣지 연결.
+
+    v7 — "받는 스텝이 없으면 새로 만든다"는 로직을 이 함수에서 제거했다.
+    이건 matching 결정(4단계: "누가 누구에게 보내는가")이 아니라, 그
+    결정이 실제 플랜 구조와 안 맞을 때 고정 규칙으로 고치는 resolve
+    행위(5단계: "insert step")이기 때문이다 — 5단계 Verify+Resolve
+    다이어그램에서 이미 "insert step"을 resolve 규칙 중 하나로 명시해
+    뒀는데, 실제 코드는 이 로직이 4단계 쪽에 섞여 있어 불일치가 있었다.
+
+    이제 이 함수는 순수하게 "이미 존재하는 노드들 사이의 엣지 연결"만
+    담당한다: send_step을 찾고, recv_step이 *이미 존재하면* 엣지를
+    연결하고 순서를 맞춘다. recv_step이 없으면 여기서 만들지 않고
+    MissingReceive를 반환해 5단계로 넘긴다.
+
+    반환: (conflict, affected, missing_receive) — 셋 중 실제로 값이
+    있는 건 상황에 따라 하나뿐이다.
+    """
     need_plan = plans[a.need_agent]
     provide_plan = plans[a.target_agent]
     affected: Set[int] = set()
@@ -496,27 +603,16 @@ def apply_handoff(
             ConflictType.DEPENDENCY, [], [a.target_agent],
             f"{a.target_agent} matched to provide '{a.target_text}' but has no send step",
             "manual review required (not auto-resolved)",
-        ), affected
+        ), affected, None
 
     recv_step = _find_step_by_verb(need_plan, a.target_text, _RECEIVE_VERBS)
     if recv_step is None:
-        clean_item = _clean_item_phrase(a.target_text)
-        new_id = max([s.step_id for s in need_plan.steps], default=0) + 1
-        recv_step = PlanStep(
-            step_id=new_id,
-            time_min=send_step.time_min + 2,
-            room=need_plan.steps[0].room if need_plan.steps else "",
-            agent_id=a.need_agent,
-            action=f"receive {clean_item}",
-            depends_on=[send_step.step_id],
-            handoff_type=None,
-            target_agent=None,
-            uncertainty=0.2,
-            notes="auto-inserted by conflict check (DEPENDENCY)",
+        # 여기서 만들지 않음 — 5단계(resolve_missing_receive)로 위임
+        return None, affected, MissingReceive(
+            need_agent=a.need_agent,
+            send_step_id=send_step.step_id,
+            target_text=a.target_text,
         )
-        need_plan.steps.append(recv_step)
-        need_plan.steps.sort(key=lambda s: (s.time_min, s.step_id))
-        affected.add(new_id)
 
     if send_step.step_id not in recv_step.depends_on:
         recv_step.depends_on = list(recv_step.depends_on) + [send_step.step_id]
@@ -540,7 +636,65 @@ def apply_handoff(
             _propagate_time_forward(plans, s.step_id, recv_step.time_min + 2, affected)
     need_plan.steps.sort(key=lambda s: (s.time_min, s.step_id))
 
-    return None, affected
+    return None, affected, None
+
+
+def resolve_missing_receive(
+    mr: "MissingReceive", plans: Dict[str, LocalPlan],
+) -> Set[int]:
+    """
+    5단계 Resolve의 "insert step" 규칙 — 4단계에서 확정된 HANDOFF가 받는
+    쪽 로컬 플랜과 구조적으로 안 맞을 때(대응 receive 스텝 없음), 고정
+    규칙으로 새 스텝을 만들어 끼워 넣는다. 로직 자체는 이전 버전의
+    apply_handoff 안에 있던 것과 동일 — 어디서 실행되는지(4단계 매칭
+    처리 중이 아니라 5단계 resolve 단계)만 바뀌었다.
+    """
+    need_plan = plans[mr.need_agent]
+    send_step = next(
+        (s for p in plans.values() for s in p.steps if s.step_id == mr.send_step_id), None,
+    )
+    affected: Set[int] = set()
+    if send_step is None:
+        return affected
+
+    clean_item = _clean_item_phrase(mr.target_text)
+    new_id = max([s.step_id for s in need_plan.steps], default=0) + 1
+    recv_step = PlanStep(
+        step_id=new_id,
+        time_min=send_step.time_min + 2,
+        room=need_plan.steps[0].room if need_plan.steps else "",
+        agent_id=mr.need_agent,
+        action=f"receive {clean_item}",
+        depends_on=[send_step.step_id],
+        handoff_type=None,
+        target_agent=None,
+        uncertainty=0.2,
+        notes="auto-inserted by conflict check (DEPENDENCY)",
+    )
+    need_plan.steps.append(recv_step)
+    need_plan.steps.sort(key=lambda s: (s.time_min, s.step_id))
+    affected.add(new_id)
+
+    if recv_step.time_min <= send_step.time_min:
+        _propagate_time_forward(plans, recv_step.step_id, send_step.time_min + 2, affected)
+
+    item_kw = _kw(clean_item)
+    outgoing_ids = _outgoing_chain_step_ids(need_plan)
+    for s in need_plan.steps:
+        if s.step_id == recv_step.step_id:
+            continue
+        first = s.action.lower().split()[0] if s.action.strip() else ""
+        if first in _RECEIVE_VERBS:
+            continue
+        if s.step_id in outgoing_ids:
+            continue
+        if item_kw & _kw(s.action) and s.time_min <= recv_step.time_min:
+            if recv_step.step_id not in s.depends_on:
+                s.depends_on = list(s.depends_on) + [recv_step.step_id]
+            _propagate_time_forward(plans, s.step_id, recv_step.time_min + 2, affected)
+    need_plan.steps.sort(key=lambda s: (s.time_min, s.step_id))
+
+    return affected
 
 
 def _outgoing_chain_prep_ids(plan: LocalPlan) -> Set[int]:
@@ -906,18 +1060,21 @@ def run(
           f"auction매칭 {sum(1 for a in assignments if a.source_step_id is None)}개), "
           f"{len(unresolved_needs)}개 미해결")
     handoff_conflicts: List[ConflictEntry] = []
+    missing_receives: List[MissingReceive] = []
     for a in assignments:
         declared = a.source_step_id is not None
         tag = "선언됨" if declared else f"bid={a.weight:.2f}"
         if a.target_kind == "PROVIDE":
             print(f"    [HANDOFF] {a.target_agent} → {a.need_agent} : {a.target_text} ({tag})")
-            conflict, _ = apply_handoff(a, plans)
+            conflict, _, missing = apply_handoff(a, plans)
             events.append({
                 "type": "edge", "kind": "handoff", "from": a.target_agent, "to": a.need_agent,
                 "label": a.target_text, "weight": a.weight, "declared": declared,
             })
             if conflict:
                 handoff_conflicts.append(conflict)
+            if missing:
+                missing_receives.append(missing)
         else:
             print(f"    [STATE_DEP] {a.need_agent} needs state from {a.target_agent}'s "
                   f"step '{a.target_text}' ({tag})")
@@ -930,7 +1087,19 @@ def run(
     for nid in unresolved_needs:
         events.append({"type": "unresolved_need", "id": nid})
 
-    # ── 1.5) orphan PASS 정리 ──────────────────────────────────────────────────
+    # ── 1.5) Resolve: 받는 쪽에 대응 스텝이 없는 HANDOFF는 여기서 삽입
+    #        ("insert step" 규칙 — 5단계 Resolve 소속. 4단계 matching은
+    #        엣지 연결까지만 담당하고, 구조적 불일치를 고치는 건 여기서) ──────────
+    for mr in missing_receives:
+        resolve_missing_receive(mr, plans)
+        print(f"    [RESOLVE] insert step: '{mr.target_text}' 수신 스텝을 "
+              f"{mr.need_agent}에 자동 삽입 (step{mr.send_step_id} 이후)")
+        events.append({
+            "type": "resolve_insert_step", "agent": mr.need_agent,
+            "label": mr.target_text, "after_step": f"step_{mr.send_step_id}",
+        })
+
+    # ── 1.6) orphan PASS 정리 ──────────────────────────────────────────────────
     cleaned = cleanup_orphan_pass(plans)
     if cleaned:
         print(f"  [CLEANUP] 수신자 없는 PASS {len(cleaned)}개 → 평범한 스텝으로 정리: {cleaned}")
