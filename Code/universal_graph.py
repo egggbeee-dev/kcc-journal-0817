@@ -543,6 +543,41 @@ def apply_handoff(
     return None, affected
 
 
+def _outgoing_chain_prep_ids(plan: LocalPlan) -> Set[int]:
+    """
+    이 plan 안에서 PASS 스텝으로 "이어지는" depends_on 조상들의 step_id
+    집합 — PASS 스텝 "자신"은 포함하지 않는다 (_outgoing_chain_step_ids와의
+    차이점).
+
+    이 구분이 중요한 이유(v3 버그 수정): 준비 스텝(예: "arrange tray")은
+    받는 쪽 상태와 무관하게 자기 아이템을 만드는 파이프라인이라, 엉뚱한
+    need와 키워드가 우연히 겹쳐도 소비자로 오인되면 안 됨 — 이건 그대로
+    제외 대상이다. 반면 PASS 스텝 자신(예: "carry tray to doorway")은
+    "받는 쪽이 준비될 때까지 실제로 기다려야 하는" 정당한 소비자일 수
+    있다 (예: 상대방 테이블이 치워지기 전까지 배달을 미뤄야 하는 경우).
+    이전 버전(_outgoing_chain_step_ids 그대로 재사용)은 PASS 스텝까지
+    통째로 배제해서, 이런 정당한 state dependency가 조용히 사라지는
+    부작용이 있었음 (실측으로 확인됨).
+    """
+    by_id = {s.step_id: s for s in plan.steps}
+    result: Set[int] = set()
+
+    def walk(sid: int) -> None:
+        if sid not in by_id or sid in result:
+            return
+        step = by_id[sid]
+        if step.handoff_type != "PASS":
+            result.add(sid)
+        for dep in step.depends_on:
+            walk(dep)
+
+    for s in plan.steps:
+        if s.handoff_type == "PASS":
+            for dep in s.depends_on:
+                walk(dep)
+    return result
+
+
 def apply_state_dependency(
     a: MatchAssignment, plans: Dict[str, LocalPlan],
 ) -> Set[int]:
@@ -550,16 +585,9 @@ def apply_state_dependency(
     STEP 타겟 매칭 → need-agent의 "소비 스텝"을 provide-step 이후로 오도록
     cross-agent DEPENDS_ON 엣지만 추가한다.
 
-    v2 — outgoing chain 제외 추가. _find_consuming_step은 키워드 겹침만
-    보고 소비 스텝을 고르는데, need 텍스트에 우연히 겹치는 단어가 있으면
-    (예: need="cleared space for serving TRAY", 그리고 같은 agent가 마침
-    "arrange ... on serving TRAY"라는 *내보내는* 스텝을 갖고 있는 경우)
-    "무언가를 준비해서 내보내는 파이프라인 스텝"을 엉뚱하게 "이 need를
-    소비하는 스텝"으로 오인할 수 있음 (실측으로 확인된 버그 — apply_handoff
-    에는 이미 _outgoing_chain_step_ids로 이 방어가 있었는데
-    apply_state_dependency에는 빠져 있었음). PASS로 뭔가를 내보내는 체인에
-    속한 스텝은 애초에 "이 need를 위해 대기하는" 소비자가 될 수 없으므로
-    후보에서 제외한다.
+    v3 — 소비자 후보에서 제외하는 대상을 "PASS로 이어지는 준비 스텝"만으로
+    좁힘 (PASS 스텝 자신은 제외하지 않음). 자세한 이유는
+    _outgoing_chain_prep_ids 참고.
     """
     need_plan = plans[a.need_agent]
     provide_step_id = int(a.target_id)
@@ -569,8 +597,8 @@ def apply_state_dependency(
     if provide_step is None:
         return set()
 
-    outgoing_ids = _outgoing_chain_step_ids(need_plan)
-    consumer = _find_consuming_step(need_plan, a.need_text, exclude_ids=outgoing_ids)
+    outgoing_prep_ids = _outgoing_chain_prep_ids(need_plan)
+    consumer = _find_consuming_step(need_plan, a.need_text, exclude_ids=outgoing_prep_ids)
     affected: Set[int] = set()
     if consumer is None:
         return affected
