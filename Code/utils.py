@@ -225,30 +225,25 @@ def compute_joint_uncertainty(joint: List[Any]) -> float:
 
 # ── 출력 헬퍼 ──────────────────────────────────────────────────────────────────
 #
-# format_joint_plan v3 — 훨씬 단순하게 재설계:
-#   - room/agent 중복 표시 제거 (이 도메인에서 room==agent라 같은 정보를
-#     두 번 보여주고 있었음) — agent 하나만 표시.
-#   - depends_on을 풀어쓴 자연어 설명 제거. 화면 출력을 시간순(T=)으로
-#     재정렬해서 보여주므로, "무엇 다음에"라는 설명 없이도 순서 자체가
-#     시간순으로 눈에 보임 (내부적으로 위상정렬 결과가 그대로 유지되어야
-#     하는 실행 순서는 joint_plan 딕셔너리의 depends_on 필드에 그대로
-#     남아있음 — 이 함수는 "화면 출력"만 바꾼 것).
-#   - PASS/RECEIVE는 요청대로 기호로 표시: [PASS → target] / [← RECEIVE from source]
-#   - notes는 «»같은 낯선 기호 없이 그냥 "- 설명"으로. auto-inserted
-#     receive 스텝의 note는 이미 RECEIVE 기호로 뜻이 드러나므로 생략.
+# format_joint_plan v4 — "after step N" 표기 도입, notes 자유 텍스트 제거:
+#   - 같은 agent 안의 순서(depends_on)는 자연어 설명 대신 화면에 실제로
+#     보이는 표시 번호로 "(after step N)"이라고 표시 — v3에서 시도했던
+#     "'X' 다음" 식 자연어 설명이 오히려 읽기 어렵다는 피드백을 반영.
+#   - notes 필드(자유 텍스트, 대개 액션을 다른 말로 반복)는 출력에서
+#     제거 — 정보량 대비 화면을 어수선하게 만든다는 피드백 반영.
+#   - PASS/RECEIVE 기호 표시는 그대로 유지: [PASS → target] / [← RECEIVE from source]
+#   - 화면 출력은 여전히 시간순(T=)으로 재정렬 — 위상정렬 결과 자체
+#     (joint_plan 딕셔너리의 depends_on)는 그대로 유지, 이 함수는 "화면
+#     출력"만 바꾼 것.
 
 def format_joint_plan(plan: List[Dict]) -> str:
-    """Joint plan을 시간순으로, PASS/RECEIVE 기호와 함께 출력."""
+    """Joint plan을 시간순으로, PASS/RECEIVE 기호 + "after step N" 표기와 함께 출력."""
     if not plan:
         return "  (empty)"
 
     by_id = {s["step_id"]: s for s in plan}
-
-    # 화면 출력은 시간순(T=)으로 재정렬 — 위상정렬 순서 그대로 보여주면
-    # 같은 시각대의 스텝들이 agent별로 뒤섞여 나와 시간이 왔다갔다 하는
-    #것처럼 보임. 안정 정렬이라 같은 시각 안에서는 원래 순서(=실행
-    # 우선순위) 그대로 유지됨.
     ordered = sorted(enumerate(plan), key=lambda p: (p[1].get("time_min", 0), p[0]))
+    display_idx = {s["step_id"]: i + 1 for i, (_, s) in enumerate(ordered)}
 
     agent_w = max((len(s.get("agent_id", "")) for s in plan), default=10)
 
@@ -258,18 +253,25 @@ def format_joint_plan(plan: List[Dict]) -> str:
         action = s.get("action", "")
         tail = ""
 
+        cross_agent_source = None
+        same_agent_dep_idx = None
+        for d in (s.get("depends_on") or []):
+            dep = by_id.get(d)
+            if dep is None:
+                continue
+            if dep.get("handoff_type") == "PASS" and dep.get("agent_id") != agent:
+                cross_agent_source = dep.get("agent_id")
+                break  # cross-agent handoff dep가 있으면 그게 표시 우선순위 1위
+            if dep.get("agent_id") == agent and same_agent_dep_idx is None:
+                same_agent_dep_idx = display_idx.get(d)
+
         if s.get("handoff_type") == "PASS" and s.get("target_agent"):
             tail += f"  [PASS \u2192 {s['target_agent']}]"
 
-        for d in (s.get("depends_on") or []):
-            dep = by_id.get(d)
-            if dep and dep.get("handoff_type") == "PASS" and dep.get("agent_id") != agent:
-                tail += f"  [\u2190 RECEIVE from {dep.get('agent_id', '?')}]"
-                break
-
-        note = (s.get("notes") or "").strip()
-        if note and "auto-inserted" not in note:
-            tail += f"  - {note}"
+        if cross_agent_source:
+            tail += f"  [\u2190 RECEIVE from {cross_agent_source}]"
+        elif same_agent_dep_idx is not None:
+            tail += f"  (after step {same_agent_dep_idx})"
 
         lines.append(
             f"  {idx:>2}. [T={s.get('time_min', 0):>2}m] [{agent:<{agent_w}}]  {action}{tail}"
