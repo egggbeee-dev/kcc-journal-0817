@@ -21,12 +21,18 @@
 #     본 시스템의 각 단계는 (a) 전역 정보가 필요한가, (b) 그 자리에서 뭔가를
 #     "판단"하는가라는 두 축으로 분류된다. 이 둘은 서로 독립적이다.
 #
-#       매칭(Auction)         : 로컬(전역 정보 불필요) + 판단 있음(bid 비교)
-#                                → 완전 decentralized
+#       매칭(Auction)         : 로컬(Offer + Local Plan 스텝 텍스트 — 매칭 전
+#                                이미 전부 공개됨) + 판단 있음(bid 비교)
+#                                → 예외 없이 완전 decentralized
+#                                  (PROVIDE 타겟이든 STEP 타겟이든 동일)
 #       Conflict Detection    : 전역(SAME_ROOM 엣지 순회 필요) + 판단 없음(verify)
 #       Conflict Resolution   : 로컬(영향받은 노드만) + 판단 있음(rule-based resolve)
 #       Kahn's Cycle Check    : 전역(그래프 전체를 봐야 사이클 유무를 앎) + 판단 없음(verify)
 #       Kahn's Cycle Break    : 로컬(끊을 엣지 하나만 선택) + 판단 있음(rule-based resolve)
+#
+#     정리: 매칭(4단계)은 전부 decentralized, 그래프(5단계)는 매칭을
+#     전혀 하지 않고 오직 verify+resolve("체크")만 한다 — 이 둘의 역할이
+#     이제 완전히 분리된다.
 #
 #     즉 이 시스템에서 "전역 정보가 필요한 지점"(verify)에는 판단이 없고,
 #     "판단이 일어나는 지점"(resolve)은 전역 정보가 필요 없다.
@@ -356,8 +362,25 @@ def compute_match_assignments(
     고정 tie-break — 어느 need-agent가 계산해도 같은 결론에 도달한다
     (consensus, 중앙 중재자 없음).
 
-    v6 — declared PASS를 별도 우선순위 계층이 아니라 auction 내부의 bid
-    보너스로 통합. Local Plan에서 LLM이 스스로 만든 PASS 선언은:
+    v8 — Local Plan 스텝 텍스트도 Offer와 동일하게 "생성 후 공개되는
+    정보"로 취급한다. 이전 버전은 Local Plan이 Coordinator에게만
+    제출되고 팀원 간 비공개라고 전제해, PROVIDE 타겟 매칭(Local)과
+    STEP 타겟 매칭(Global — Coordinator만 계산 가능)을 구분했다. 이제는
+    Local Plan 생성이 끝나는 즉시 그 스텝 텍스트도 Offer처럼 팀 전체에
+    공개된다고 정의하므로, 이 구분이 사라진다 — PROVIDE든 STEP이든
+    매칭에 필요한 정보(Offer + Local Plan 스텝 텍스트)가 매칭 시작 전에
+    이미 전부 공개돼 있고, 계산 방식(bid+합의)도 원래 동일했으므로,
+    Auction Matching 전체가 예외 없이 decentralized(개념적으로 각
+    need-agent가 로컬로 계산 가능)라고 부를 수 있다.
+
+    (참고: 이전 버전에서 이 부분에 "Local vs Global" 구분이 있었음 — 이
+    구분은 정보 공개 여부에 대한 설계 선택이 바뀌면서 더 이상 필요 없음.
+    그래프(5단계)는 이제 매칭을 전혀 수행하지 않고, 순수 검증(verify)과
+    해소(resolve)만 담당한다 — "그래프는 체크만 한다"는 원칙.)
+
+    declared PASS는 별도 우선순위 계층이 아니라 auction 내부의 bid
+    보너스로 통합되어 있다. Local Plan에서 LLM이 스스로 만든 PASS
+    선언은:
       1) target agent의 need 중 하나와 임베딩 유사도가 grounding
          threshold(=_min_match_sim(), 나머지 매칭과 동일한 기준)를 넘으면
          "근거 있음"으로 보고 DECLARED_BID_BONUS를 받는다 — 사실상 거의
@@ -1037,7 +1060,11 @@ def run(
     for aid in agent_ids:
         events.append({"type": "node", "kind": "agent", "id": aid})
 
-    # ── 1) 매칭 (CBAA 스타일 auction, P2P) ────────────────────────────────────
+    # ── 1) 매칭 (CBAA 스타일 auction, 전부 decentralized) ──────────────────────
+    # 이 시점(각 agent의 Local Plan 생성이 모두 끝난 직후)부터 Local Plan
+    # 스텝 텍스트도 Offer와 동일하게 "공개된 정보"로 취급한다 — Coordinator
+    # 전용이 아니다. PROVIDE 타겟이든 STEP 타겟이든 매칭에 필요한 정보가
+    # 이 시점에 전부 공개돼 있으므로, 이후 매칭 전체가 decentralized다.
     items = build_item_nodes(offers)
     for it in items:
         events.append({
