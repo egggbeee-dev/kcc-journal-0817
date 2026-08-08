@@ -13,7 +13,7 @@
 #                          "dining area cleared"는 물건이 아니라 다른 agent의
 #                          행동으로 이미 충족되는 상태임)
 #     - SAME_ROOM   : 다른 agent의 Step끼리 같은 room이면 미리 그어둠
-#                     (TEMPORAL/REDUNDANCY 체크가 이 엣지를 "순회"하도록)
+#                     (REDUNDANCY 체크가 이 엣지를 "순회"하도록. TEMPORAL은 v9에서 제거됨)
 #     - DEPENDS_ON  : 같은 agent 안(원래) + STATE_DEPENDENCY로 추가되는
 #                     cross-agent 순서 제약
 #
@@ -623,9 +623,9 @@ def apply_handoff(
 
     if send_step is None:
         return ConflictEntry(
-            ConflictType.DEPENDENCY, [], [a.target_agent],
+            ConflictType.DEPENDENCY, [], [a.target_agent],  # Match Failure — 확정된 매칭인데 실제 송신 스텝이 없음
             f"{a.target_agent} matched to provide '{a.target_text}' but has no send step",
-            "manual review required (not auto-resolved)",
+            "notified — no auto-fix (target agent should be informed manually)",
         ), affected, None
 
     recv_step = _find_step_by_verb(need_plan, a.target_text, _RECEIVE_VERBS)
@@ -817,142 +817,31 @@ def cleanup_orphan_pass(plans: Dict[str, LocalPlan]) -> List[int]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SAME_ROOM 엣지 (미리 구축 — TEMPORAL/REDUNDANCY 체크가 이 엣지를 순회)
+# v10 — SAME_ROOM 엣지 기반 conflict 탐지(build_same_room_edges,
+# detect_conflicts_via_edges, resolve_conflict)를 전체 제거함.
+#
+# 순서대로 있었던 5종 conflict 중 남은 게 하나도 없어졌기 때문:
+#   - TEMPORAL: v9에서 제거 (SAME_ROOM 엣지 자체가 room 구조상 거의 발생 안 함)
+#   - CANNOT_DO, OBSERVABILITY: v9에서 localplan.py 로컬 자체검사로 이동
+#   - REDUNDANCY: v10에서 제거. SAME_ROOM 조건에 얹혀 있던 게 애초에 설계
+#     오류였음(중복 낭비는 물리적 위치와 무관한 문제인데 왜 같은 room일
+#     때만 확인하는지 정당화가 안 됐음) + 이 태스크 세팅에서는 SAME_ROOM
+#     엣지가 사실상 전혀 발생하지 않아 검증 자체가 불가능했음.
+#
+# 그 결과 SAME_ROOM 엣지를 사용하는 conflict 유형이 하나도 안 남아서,
+# 이 엣지 구축/순회 로직 자체가 죽은 코드가 됨 — 통째로 제거.
+#
+# 5단계(그래프)에 남는 건 이제 정확히 둘뿐이다:
+#   - Match Failure : matching 실패(unresolved need, send step 못 찾음 등)로
+#     별도 누적되는 것 — 자동 해소 없이 사람에게 통보만 함 (내부 상수는
+#     하위 호환을 위해 여전히 ConflictType.DEPENDENCY를 씀)
+#   - Cycle         : Kahn's algorithm이 DEPENDS_ON 그래프에서 탐지 + 해소
+#     (검증=전역·무판단, 해소="break edge" 규칙)
+#   - Missing Receive : declared HANDOFF는 확정됐지만 받는 쪽 로컬 플랜에
+#     대응 스텝이 없는 경우 — 검증은 4단계 matching 처리 중 발견되고,
+#     해소("insert step" 규칙)는 5단계에서 수행 (내부 상수는 기존에
+#     미사용이던 ConflictType.HANDOFF를 재사용)
 # ══════════════════════════════════════════════════════════════════════════════
-
-def build_same_room_edges(plans: Dict[str, LocalPlan]) -> Dict[int, List[int]]:
-    all_steps = [s for p in plans.values() for s in p.steps]
-    by_room: Dict[str, List[PlanStep]] = defaultdict(list)
-    for s in all_steps:
-        room = (s.room or "").strip().lower()
-        if room:
-            by_room[room].append(s)
-
-    edges: Dict[int, List[int]] = defaultdict(list)
-    for room, steps in by_room.items():
-        for i in range(len(steps)):
-            for j in range(i + 1, len(steps)):
-                a, b = steps[i], steps[j]
-                if a.agent_id == b.agent_id:
-                    continue
-                edges[a.step_id].append(b.step_id)
-                edges[b.step_id].append(a.step_id)
-    return edges
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CONFLICT 탐지 (global verify)
-# ══════════════════════════════════════════════════════════════════════════════
-
-_TEMPORAL_WINDOW_MIN = 3
-REDUNDANCY_SIM_THRESH = 0.92
-
-
-def detect_conflicts_via_edges(
-    plans: Dict[str, LocalPlan],
-    offers: Dict[str, Offer],
-    same_room_edges: Dict[int, List[int]],
-    only_step_ids: Optional[Set[int]] = None,
-) -> List[ConflictEntry]:
-    all_steps = {s.step_id: s for p in plans.values() for s in p.steps}
-    conflicts: List[ConflictEntry] = []
-
-    node_ids = only_step_ids if only_step_ids is not None else set(same_room_edges.keys())
-    seen_pairs: Set[Tuple[int, int]] = set()
-
-    pair_list: List[Tuple[int, int]] = []
-    for sid in node_ids:
-        for nbr in same_room_edges.get(sid, []):
-            pair = (min(sid, nbr), max(sid, nbr))
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            pair_list.append(pair)
-
-    if pair_list:
-        actions = [all_steps[a].action for a, b in pair_list] + [all_steps[b].action for a, b in pair_list]
-        vecs = embed_texts(actions) if actions else np.zeros((0, 1))
-        n = len(pair_list)
-        for k, (sid1, sid2) in enumerate(pair_list):
-            s1, s2 = all_steps[sid1], all_steps[sid2]
-            if abs(s1.time_min - s2.time_min) < _TEMPORAL_WINDOW_MIN:
-                conflicts.append(ConflictEntry(
-                    ConflictType.TEMPORAL, [s1.step_id, s2.step_id],
-                    [s1.agent_id, s2.agent_id],
-                    f"same room '{s1.room}', time overlap ({s1.time_min}m vs {s2.time_min}m)",
-                    "shift the later step's time_min later",
-                ))
-            v1, v2 = vecs[k], vecs[n + k]
-            sim = float(cosine_sim_matrix(v1[None, :], v2[None, :])[0, 0])
-            if sim >= REDUNDANCY_SIM_THRESH:
-                later = s1 if s1.step_id > s2.step_id else s2
-                conflicts.append(ConflictEntry(
-                    ConflictType.REDUNDANCY, [s1.step_id, s2.step_id],
-                    [s1.agent_id, s2.agent_id],
-                    f"near-duplicate action across agents (sim={sim:.2f}): "
-                    f"'{s1.action}' / '{s2.action}'",
-                    f"remove step {later.step_id}",
-                ))
-
-    for sid in (only_step_ids if only_step_ids is not None else all_steps.keys()):
-        s = all_steps.get(sid)
-        if s is None or "auto-inserted" in (s.notes or ""):
-            continue
-        offer = offers.get(s.agent_id)
-        if not offer:
-            continue
-        for cd in offer.cannot_do:
-            if _kw(cd.action) and _kw(cd.action) <= _kw(s.action):
-                conflicts.append(ConflictEntry(
-                    ConflictType.CANNOT_DO, [s.step_id], [s.agent_id],
-                    f"agent marked cannot_do: '{cd.action}' (reason={cd.reason})",
-                    f"remove step {s.step_id}",
-                ))
-                break
-
-    for sid in (only_step_ids if only_step_ids is not None else all_steps.keys()):
-        s = all_steps.get(sid)
-        if s is None or s.handoff_type or "auto-inserted" in (s.notes or ""):
-            continue
-        offer = offers.get(s.agent_id)
-        if not offer:
-            continue
-        pool = _kw(offer.obs_scope)
-        for cd in offer.can_do:
-            pool |= _kw(cd)
-        kw = _kw(s.action)
-        if kw and pool and not (kw & pool):
-            conflicts.append(ConflictEntry(
-                ConflictType.OBSERV, [s.step_id], [s.agent_id],
-                f"action '{s.action}' references objects outside observed scope",
-                f"remove step {s.step_id}",
-            ))
-
-    return conflicts
-
-
-def resolve_conflict(conflict: ConflictEntry, plans: Dict[str, LocalPlan]) -> Set[int]:
-    affected: Set[int] = set()
-
-    if conflict.conflict_type == ConflictType.TEMPORAL:
-        s1_id, s2_id = conflict.step_ids
-        later_id = max(s1_id, s2_id)
-        earlier_id = min(s1_id, s2_id)
-        earlier_time = next(
-            (o.time_min for p in plans.values() for o in p.steps if o.step_id == earlier_id), None,
-        )
-        if earlier_time is not None:
-            _propagate_time_forward(plans, later_id, earlier_time + _TEMPORAL_WINDOW_MIN, affected)
-
-    elif conflict.conflict_type in (ConflictType.REDUNDANCY, ConflictType.CANNOT_DO, ConflictType.OBSERV):
-        remove_id = conflict.step_ids[-1] if conflict.conflict_type == ConflictType.REDUNDANCY else conflict.step_ids[0]
-        for plan in plans.values():
-            before = len(plan.steps)
-            plan.steps = [s for s in plan.steps if s.step_id != remove_id]
-            if len(plan.steps) != before:
-                affected.add(remove_id)
-
-    return affected
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1050,7 +939,7 @@ def run(
     plans: Dict[str, LocalPlan],
     task: str = "",
     room_adjacency: Optional[Dict[Tuple[str, str], int]] = None,
-    max_rounds: int = 10,
+    max_rounds: int = 10,  # v10부터 미사용 (conflict 재시도 루프 제거됨) — 하위 호환용으로만 유지
     auction_rounds: int = DEFAULT_AUCTION_ROUNDS,
 ) -> dict:
     plans = copy.deepcopy(plans)
@@ -1116,11 +1005,20 @@ def run(
 
     # ── 1.5) Resolve: 받는 쪽에 대응 스텝이 없는 HANDOFF는 여기서 삽입
     #        ("insert step" 규칙 — 5단계 Resolve 소속. 4단계 matching은
-    #        엣지 연결까지만 담당하고, 구조적 불일치를 고치는 건 여기서) ──────────
+    #        엣지 연결까지만 담당하고, 구조적 불일치를 고치는 건 여기서).
+    #        v11 — Missing Receive를 정식 conflict 카테고리로 승격.
+    #        내부 상수는 ConflictType.HANDOFF를 재사용(기존에 미사용 상수) ──
+    resolved: List[ConflictEntry] = []
     for mr in missing_receives:
         resolve_missing_receive(mr, plans)
         print(f"    [RESOLVE] insert step: '{mr.target_text}' 수신 스텝을 "
               f"{mr.need_agent}에 자동 삽입 (step{mr.send_step_id} 이후)")
+        resolved.append(ConflictEntry(
+            ConflictType.HANDOFF, [mr.send_step_id], [mr.need_agent],
+            f"declared HANDOFF confirmed but {mr.need_agent} had no receive step for "
+            f"'{mr.target_text}'",
+            "insert step",
+        ))
         events.append({
             "type": "resolve_insert_step", "agent": mr.need_agent,
             "label": mr.target_text, "after_step": f"step_{mr.send_step_id}",
@@ -1133,49 +1031,41 @@ def run(
         for sid in cleaned:
             events.append({"type": "orphan_pass_cleaned", "id": f"step_{sid}"})
 
-    # ── 2) SAME_ROOM 엣지 구축 + Conflict 워크리스트 ───────────────────────────
-    same_room_edges = build_same_room_edges(plans)
-    conflict_queue = deque(detect_conflicts_via_edges(plans, offers, same_room_edges))
-    resolved: List[ConflictEntry] = []
-    rounds = 0
-    while conflict_queue and rounds < max_rounds:
-        rounds += 1
-        c = conflict_queue.popleft()
-        affected = resolve_conflict(c, plans)
-        resolved.append(c)
-        events.append({
-            "type": "conflict_resolved", "conflict_type": c.conflict_type,
-            "step_ids": c.step_ids, "description": c.description,
-        })
-        if affected:
-            same_room_edges = build_same_room_edges(plans)
-            new_conflicts = detect_conflicts_via_edges(plans, offers, same_room_edges, only_step_ids=affected)
-            for nc in new_conflicts:
-                if nc not in resolved:
-                    conflict_queue.append(nc)
+    # v10 — SAME_ROOM 엣지 기반 conflict 워크리스트(구 2단계) 제거됨. 5단계에
+    # 남은 conflict는 Missing Receive(위), Cycle(바로 아래), Match Failure
+    # (핸드오프에 4단계에서 그대로 누적된 것)뿐이다.
+    print(f"  [MATCH FAILURE] {len(handoff_conflicts) + len(unresolved_needs)}개 — 자동 해소 불가, 통보만 함")
 
-    print(f"  [CONFLICT] {len(resolved)}개 자동 해결, {len(handoff_conflicts)}개 미해결(DEPENDENCY)")
-
-    # ── 3) Merge (Kahn's algorithm) ───────────────────────────────────────────
+    # ── 2) Merge (Kahn's algorithm — global verify(cycle 탐지) + rule-based resolve) ──
     joint_plan, broken_cycle_edges = merge_joint_plan(plans)
     for from_id, to_id in broken_cycle_edges:
         events.append({"type": "cycle_broken", "from": f"step_{from_id}", "to": f"step_{to_id}"})
+        resolved.append(ConflictEntry(
+            ConflictType.REDUNDANCY, [from_id, to_id], [],  # 내부 상수 재사용, 표시명은 "Cycle"
+            f"dependency cycle detected — edge {from_id}\u2192{to_id} broken (cross-agent edge preferred)",
+            "break edge",
+        ))
     events.append({
         "type": "final_order",
         "order": [s["step_id"] for s in joint_plan],
     })
 
+    match_failures = handoff_conflicts + [
+        ConflictEntry(
+            ConflictType.DEPENDENCY, [], [], f"unmatched need item: {nid}",
+            "notified — no auto-fix (no target could satisfy this need)",  # Match Failure — 사람에게 통보만, 자동 해소 없음
+        )
+        for nid in unresolved_needs
+    ]
+
     return {
         "updated_plans": plans,
         "assignments": assignments,
         "conflicts_resolved": resolved,
-        "conflicts_unresolved": handoff_conflicts + [
-            ConflictEntry(ConflictType.DEPENDENCY, [], [], f"unmatched need item: {nid}", "no target found")
-            for nid in unresolved_needs
-        ],
+        "conflicts_unresolved": match_failures,
         "broken_cycle_edges": broken_cycle_edges,
         "orphan_pass_cleaned": cleaned,
         "joint_plan": joint_plan,
-        "joint_plan_text": format_joint_plan(joint_plan),
+        "joint_plan_text": format_joint_plan(joint_plan, unresolved=match_failures),
         "graph_events": events,
     }
