@@ -225,16 +225,10 @@ def compute_joint_uncertainty(joint: List[Any]) -> float:
 
 # ── 출력 헬퍼 ──────────────────────────────────────────────────────────────────
 #
-# format_joint_plan v4 — "after step N" 표기 도입, notes 자유 텍스트 제거:
-#   - 같은 agent 안의 순서(depends_on)는 자연어 설명 대신 화면에 실제로
-#     보이는 표시 번호로 "(after step N)"이라고 표시 — v3에서 시도했던
-#     "'X' 다음" 식 자연어 설명이 오히려 읽기 어렵다는 피드백을 반영.
-#   - notes 필드(자유 텍스트, 대개 액션을 다른 말로 반복)는 출력에서
-#     제거 — 정보량 대비 화면을 어수선하게 만든다는 피드백 반영.
-#   - PASS/RECEIVE 기호 표시는 그대로 유지: [PASS → target] / [← RECEIVE from source]
-#   - 화면 출력은 여전히 시간순(T=)으로 재정렬 — 위상정렬 결과 자체
-#     (joint_plan 딕셔너리의 depends_on)는 그대로 유지, 이 함수는 "화면
-#     출력"만 바꾼 것.
+# format_joint_plan v4 — "after step N" 표기, PASS/RECEIVE 기호, notes 제거.
+# (v5에서 시도했던 Match Failure 통보 배너는 되돌림 — Match Failure는
+# 그냥 조용히 conflicts_unresolved로만 남기고, 화면 출력엔 안 섞는 쪽으로
+# 결정. 필요하면 result["conflicts_unresolved"]를 따로 확인하면 됨.)
 
 def format_joint_plan(plan: List[Dict]) -> str:
     """Joint plan을 시간순으로, PASS/RECEIVE 기호 + "after step N" 표기와 함께 출력."""
