@@ -249,17 +249,23 @@ def format_joint_plan(plan: List[Dict]) -> str:
 
         cross_agent_source = None
         same_agent_dep_idx = None
+        is_self_pass = s.get("handoff_type") == "PASS"
         for d in (s.get("depends_on") or []):
             dep = by_id.get(d)
             if dep is None:
                 continue
-            if dep.get("handoff_type") == "PASS" and dep.get("agent_id") != agent:
+            # v6 — 자기 자신이 PASS(보내는 스텝)면 RECEIVE 태그를 붙이지
+            # 않는다. "보내면서 동시에 받는다"는 물리적으로 모순이며,
+            # 이건 상위 로직(4단계 State-Dependency 매칭)의 오매칭이
+            # 표시 단계까지 새어나온 경우다 — 여기서 최소한 화면 표시는
+            # 막는 안전장치.
+            if not is_self_pass and dep.get("handoff_type") == "PASS" and dep.get("agent_id") != agent:
                 cross_agent_source = dep.get("agent_id")
                 break  # cross-agent handoff dep가 있으면 그게 표시 우선순위 1위
             if dep.get("agent_id") == agent and same_agent_dep_idx is None:
                 same_agent_dep_idx = display_idx.get(d)
 
-        if s.get("handoff_type") == "PASS" and s.get("target_agent"):
+        if is_self_pass and s.get("target_agent"):
             tail += f"  [PASS \u2192 {s['target_agent']}]"
 
         if cross_agent_source:
