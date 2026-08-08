@@ -98,6 +98,12 @@ RULES:
 5. need_from_other: 1-2 things you genuinely need from ANY other agent to complete
    the task. Focus on physical items or critical information, not generic
    confirmations. You don't know who can provide it yet - just state the need.
+   - Only list a need if it is plausibly common household equipment that some
+     OTHER zone in this house could realistically have — not specialized gear
+     (e.g. "vacuum cleaner", "cleaning supplies") unless you have a concrete
+     reason to think another zone would stock it.
+   - If you are not sure anyone else could provide it, do not list it — an
+     unfulfillable need is worse than no need at all.
 6. Think about COLLABORATION: what can you prepare that helps the team?
 7. Return ONLY valid JSON inside <JSON> tags.
 
