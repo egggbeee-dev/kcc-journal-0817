@@ -1066,6 +1066,6 @@ def run(
         "broken_cycle_edges": broken_cycle_edges,
         "orphan_pass_cleaned": cleaned,
         "joint_plan": joint_plan,
-        "joint_plan_text": format_joint_plan(joint_plan, unresolved=match_failures),
+        "joint_plan_text": format_joint_plan(joint_plan),
         "graph_events": events,
     }
