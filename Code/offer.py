@@ -98,12 +98,21 @@ RULES:
 5. need_from_other: 1-2 things you genuinely need from ANY other agent to complete
    the task. Focus on physical items or critical information, not generic
    confirmations. You don't know who can provide it yet - just state the need.
-   - Only list a need if it is plausibly common household equipment that some
-     OTHER zone in this house could realistically have — not specialized gear
-     (e.g. "vacuum cleaner", "cleaning supplies") unless you have a concrete
-     reason to think another zone would stock it.
-   - If you are not sure anyone else could provide it, do not list it — an
-     unfulfillable need is worse than no need at all.
+   - Think about your zone's ROLE in the shared global task, not just what is
+     physically visible in your own images. If your zone is where the main
+     activity of the task happens (e.g. where guests will gather, eat, or be
+     served), explicitly state what that role plausibly requires from
+     teammates (e.g. food or drink from a kitchen zone), even if you cannot
+     see those items yourself.
+   - Prefer common, general-purpose items over specialized equipment
+     (e.g. prefer "snacks or drinks" over "vacuum cleaner" or "cleaning
+     supplies") — common items are far more likely to be stocked in another
+     zone, so they are safer to state even under uncertainty.
+   - Do NOT leave need_from_other empty just to avoid uncertainty. Silence
+     guarantees no help ever arrives — a stated need that turns out
+     unfulfillable costs nothing beyond one skipped match, but an unstated
+     need that was actually fulfillable means a real collaboration
+     opportunity is lost entirely. When in doubt, state the need.
 6. Think about COLLABORATION: what can you prepare that helps the team?
 7. Return ONLY valid JSON inside <JSON> tags.
 
