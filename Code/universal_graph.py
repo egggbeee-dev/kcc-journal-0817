@@ -535,9 +535,26 @@ def _find_step_by_verb(plan: LocalPlan, item_text: str, verbs: Set[str]) -> Opti
 
 
 def _find_consuming_step(plan: LocalPlan, need_text: str, exclude_ids: Set[int]) -> Optional[PlanStep]:
+    """
+    need 텍스트 키워드와 겹치는, 아직 처리 안 된 소비 스텝을 찾음
+    (상태 의존성용).
+
+    v13 — PASS 스텝은 소비자 후보에서 항상 제외한다. PASS는 "뭔가를
+    내보내는" 행위지 "다른 agent의 상태를 소비하는" 행위가 아니다.
+    이전엔 outgoing_prep_ids(준비 단계만 제외, PASS 자신은 포함)로만
+    걸렀는데, 이 경우 완전히 무관한 agent의 PASS 스텝이 키워드가 우연히
+    겹친다는 이유만으로 소비자로 잘못 선택되는 버그가 실측으로 확인됐다
+    (bathroom의 towel PASS가 kitchen의 tray PASS를 "기다리는" 관계로
+    잘못 엮여, 최종 출력에서 PASS 스텝에 RECEIVE 태그까지 붙는 표시
+    오류로 이어졌음). PASS 스텝이 정말 소비자여야 하는 경우(받는 쪽이
+    준비될 때까지 기다려야 하는 경우)는 apply_handoff의 HANDOFF 경로가
+    이미 별도로 처리하므로, 여기서 PASS를 다시 후보로 볼 필요가 없다.
+    """
     need_kw = _kw(need_text)
     for s in plan.steps:
         if s.step_id in exclude_ids:
+            continue
+        if s.handoff_type == "PASS":
             continue
         if need_kw & _kw(s.action):
             return s
