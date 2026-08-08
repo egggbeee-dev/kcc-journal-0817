@@ -403,8 +403,28 @@ def compute_match_assignments(
         return [], []
 
     # targets: (kind, id, agent_id, text, declared_source_step_id)
+    #
+    # v12 — 중복 target 등록 버그 수정. declared PASS(예: "carry snack
+    # plate... to doorway")와 그 아이템의 원본 Offer.can_provide 항목
+    # (예: "serving tray with snacks")은 사실 같은 물리적 아이템을 가리키는
+    # 두 개의 텍스트 표현일 뿐인데, 이전 버전은 이 둘을 서로 다른 target
+    # index로 각각 등록했다. auction은 target별로 승자 하나만 보장하니,
+    # "같은 물건"이 두 target으로 쪼개져 있으면 서로 다른 need(예:
+    # living_room과 bedroom)가 "각자 다른 target"을 이겨서 결과적으로
+    # 같은 물리적 아이템을 동시에 두 곳이 받는 버그가 생겼다(실측으로
+    # 확인됨 — 같은 kitchen 스텝에 두 개의 receive 스텝이 생성됨).
+    #
+    # 수정: declared candidate가 이미 대표하고 있는 (agent, 키워드) 조합과
+    # 겹치는 raw PROVIDE 항목은 별도 target으로 추가하지 않는다 — declared
+    # candidate 하나만 그 물리적 아이템의 유일한 target으로 남는다.
+    declared_covered_kw: Dict[str, List[Set[str]]] = defaultdict(list)
+    for _sid, _agent, _tgt, _text in declared_candidates:
+        declared_covered_kw[_agent].append(_kw(_text))
+
     targets: List[Tuple[str, str, str, str, Optional[int]]] = []
     for p in provides:
+        if any(_kw(p.text) & kwset for kwset in declared_covered_kw.get(p.agent_id, [])):
+            continue  # 이미 declared candidate가 같은 물리적 아이템을 대표함 — 중복 등록 방지
         targets.append(("PROVIDE", p.item_id, p.agent_id, p.text, None))
     for s in all_steps:
         targets.append(("STEP", str(s.step_id), s.agent_id, s.action, None))
