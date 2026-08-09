@@ -77,6 +77,7 @@ import copy
 import math
 import re
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -253,11 +254,25 @@ def _gather_declared_candidates(
     return out
 
 
-def _auction_phase(
+def _beats(challenger_score: float, challenger_idx: int,
+           holder_score: float, holder_idx: int, needs: List[ItemNode]) -> bool:
+    """
+    승자 판정 규칙 — "bid 값이 더 높은가, 동률이면 item_id 사전순".
+    공개되고 결정론적인 규칙이라 어느 스레드가 실행해도 같은 결론에
+    도달한다. v13부터 이 함수는 실제로 여러 OS 스레드에서 각자 호출된다
+    — "중재자"가 판정하는 게 아니라, 각 스레드가 이 공개 규칙을 스스로
+    적용해 판정한다.
+    """
+    if challenger_score != holder_score:
+        return challenger_score > holder_score
+    return needs[challenger_idx].item_id < needs[holder_idx].item_id
+
+
+def _local_propose(
     need_idx: int,
     sim: np.ndarray,
     valid_bidders: Dict[int, List[int]],
-    current_winner: Dict[int, Tuple[int, float]],
+    public_winner: Dict[int, Tuple[int, float]],
     needs: List[ItemNode],
 ) -> Optional[Tuple[int, float]]:
     """
@@ -265,33 +280,26 @@ def _auction_phase(
     본떠 명시적으로 분리함.
 
     need_idx 하나만의 완전히 로컬인 연산: 유효하게 입찰 가능한 target들 중,
-    "직전 라운드까지 확정되어 공개된 낙찰 현황"(current_winner)을 기준으로
-    자신이 이길 수 있는(또는 아직 아무도 없는) target 중 bid가 가장 높은
-    것 하나를 "제안"으로 고른다.
+    "직전 라운드까지 확정되어 공개(broadcast)된 winner table"(public_winner,
+    읽기 전용 스냅샷)을 기준으로 자신이 이길 수 있는(또는 아직 아무도
+    없는) target 중 bid가 가장 높은 것 하나를 "제안"으로 고른다.
 
-    current_winner를 참조하는 게 "로컬"이라는 원칙을 깨지 않는 이유:
-    이건 이번 라운드에 다른 need가 몰래 뭘 제안하는지 훔쳐보는 게 아니라,
-    이미 이전 라운드에 합의(consensus)되어 공개 broadcast된 정보를 읽는
-    것이다 — CBAA/GCAA 에이전트도 정확히 이렇게 동작한다: 매 라운드
-    "공개된 현재 낙찰 현황 대비 내가 이길 수 있는 가장 좋은 target"에
-    다시 도전한다. 이 스냅샷을 안 보면(초기 버전의 버그), 이길 수 없는
-    target에 영원히 재도전만 하다가 대안으로 못 넘어가는 문제가 생김
-    (실측으로 확인됨 — 아래 unit test 참고).
+    v14 — 이 함수는 어떤 공유 가변 상태도 건드리지 않는다(순수 읽기 전용
+    계산). 그래서 여러 need를 실제 스레드로 동시에 실행해도 락이 전혀
+    필요 없다 — 이전 버전(v13)은 이 계산 자체는 락 밖에서 병렬로 돌았지만
+    "쓰기" 시점엔 여전히 공유 딕셔너리에 락을 걸어야 했다. 이제는 쓰기
+    자체가 없다 — 모든 agent가 "이전 라운드까지의 공개 정보"라는 동일한
+    입력을 받아 각자 계산만 하고, 실제 winner table 갱신은
+    `_consensus_update`(순수 함수)가 그 계산 결과들을 모아 새로 만들어낸다.
     """
-    def _beats(challenger_score: float, challenger_idx: int,
-               holder_score: float, holder_idx: int) -> bool:
-        if challenger_score != holder_score:
-            return challenger_score > holder_score
-        return needs[challenger_idx].item_id < needs[holder_idx].item_id
-
     best_j: Optional[int] = None
     best_score = -1.0
     for j, bidders in valid_bidders.items():
         if need_idx not in bidders:
             continue
         score = float(sim[need_idx, j])
-        holder = current_winner.get(j)
-        if holder is not None and holder[0] != need_idx and not _beats(score, need_idx, holder[1], holder[0]):
+        holder = public_winner.get(j)
+        if holder is not None and holder[0] != need_idx and not _beats(score, need_idx, holder[1], holder[0], needs):
             continue  # 공개된 현재 낙찰자를 못 이기는 target은 제안 후보에서 제외
         if score > best_score:
             best_score, best_j = score, j
@@ -300,47 +308,37 @@ def _auction_phase(
     return best_j, best_score
 
 
-def _consensus_phase(
+def _consensus_update(
+    prior_winner: Dict[int, Tuple[int, float]],
     proposals: Dict[int, Tuple[int, float]],
-    current_winner: Dict[int, Tuple[int, float]],
-    matched: Set[int],
     needs: List[ItemNode],
-) -> bool:
+) -> Dict[int, Tuple[int, float]]:
     """
-    합의 단계(Consensus Phase) — 이번 라운드에 모인 모든 제안(proposals)을
-    훑으며 승자를 확정한다.
+    합의 재계산(Consensus Update) — v14. 이전 라운드까지의 공개 winner
+    table(prior_winner)과, 이번 라운드에 broadcast된 모든 제안(proposals)
+    만 입력으로 받아, 새로운 winner table을 처음부터 계산해내는 **순수
+    함수**다. 기존의 공유 딕셔너리를 락으로 보호하며 "제자리에서 갱신"
+    하는 게 아니라, 매번 새 딕셔너리를 반환한다 — 이 함수 실행 중에는
+    어떤 공유 가변 상태도 건드리지 않으므로 락이 필요 없다.
 
-    승자 판정 규칙은 "bid 값이 더 높은가, 동률이면 item_id 사전순"뿐이라,
-    이 규칙 자체는 공개되어 있고 결정론적이다 — 그래서 어느 need-agent가
-    이 규칙을 스스로 적용해도(즉 이 함수를 각자 로컬로 돌려도) 항상 같은
-    결론에 도달한다. 특정 프로세스가 "중재자"로서 승패를 결정하는 게
-    아니라, 모두가 같은 공개 규칙 위에서 같은 답에 수렴하는 것 — 이게
-    "합의(consensus)"의 정확한 의미다. 참조 구현은 명료성을 위해 이걸
-    하나의 함수로 순차 처리하지만, 결과는 각 need-agent가 독립적으로
-    이 규칙을 적용한 것과 동일하다.
-
-    반환: 이번 라운드에 낙찰 현황이 하나라도 바뀌었는지 여부(수렴 판정용).
+    이 함수의 핵심 성질: 입력(prior_winner, proposals)이 모든 agent에게
+    동일하게 broadcast되므로, **어느 agent가 이 함수를 실행하든 항상
+    똑같은 새 winner table이 나온다.** 그래서 이건 "누군가 중앙에서
+    갱신을 결정"하는 게 아니라 "모두가 각자 계산해도 같은 답이 나오는"
+    것이다. 참조 구현은 효율을 위해 이 함수를 한 번만 호출하지만, 이건
+    N개의 agent가 각자 이 함수를 실행해도 결정론성 덕분에 항상 동일한
+    결과가 나온다는 것을 전제로 한 안전한 생략이다 — 중복 계산을
+    아끼는 것뿐이지, "중앙이 대신 결정해준다"는 뜻이 아니다.
     """
-    def _beats(challenger_score: float, challenger_idx: int,
-               holder_score: float, holder_idx: int) -> bool:
-        if challenger_score != holder_score:
-            return challenger_score > holder_score
-        return needs[challenger_idx].item_id < needs[holder_idx].item_id
-
-    changed = False
+    new_winner = dict(prior_winner)
     order = sorted(proposals.keys(), key=lambda i: needs[i].item_id)
     for i in order:
         target_j, score = proposals[i]
-        holder = current_winner.get(target_j)
-        if holder is not None and not _beats(score, i, holder[1], holder[0]):
+        holder = new_winner.get(target_j)
+        if holder is not None and holder[0] != i and not _beats(score, i, holder[1], holder[0], needs):
             continue
-        prev = current_winner.get(target_j)
-        if prev is not None:
-            matched.discard(prev[0])
-        current_winner[target_j] = (i, score)
-        matched.add(i)
-        changed = True
-    return changed
+        new_winner[target_j] = (i, score)
+    return new_winner
 
 
 def compute_match_assignments(
@@ -370,8 +368,22 @@ def compute_match_assignments(
     공개된다고 정의하므로, 이 구분이 사라진다 — PROVIDE든 STEP이든
     매칭에 필요한 정보(Offer + Local Plan 스텝 텍스트)가 매칭 시작 전에
     이미 전부 공개돼 있고, 계산 방식(bid+합의)도 원래 동일했으므로,
-    Auction Matching 전체가 예외 없이 decentralized(개념적으로 각
-    need-agent가 로컬로 계산 가능)라고 부를 수 있다.
+    Auction Matching 전체가 예외 없이 decentralized라고 부를 수 있다.
+
+    v13→v14 — "decentralized"라는 표현이 이제 이론적 성질뿐 아니라 실행
+    방식으로도 성립한다. v6~v12는 "결과가 분산 계산과 동일하다"는
+    보장만 있었을 뿐, 실제로는 단일 프로세스(Coordinator)가 모든 need를
+    순차적으로 계산했다 — "decentralizable(분산 가능)"이지 "실제로
+    decentralized하게 실행 중"은 아니었다. v13은 이걸 실제 OS 스레드로
+    동시 실행하도록 바꿨지만, 낙찰 현황을 담은 공유 딕셔너리를 락으로
+    보호하는 compare-and-swap 방식이라 "쓰기 시점엔 여전히 공유 가변
+    상태가 있다"는 한계가 남아있었다. v14는 그 공유 가변 상태 자체를
+    없앴다: 각 라운드마다 (1) 제안 계산은 실제 스레드에서 완전히 읽기
+    전용으로 병렬 실행되고(락 불필요), (2) 제안들이 다 모이면(broadcast)
+    새 winner table은 순수 함수(`_consensus_update`)가 "이전 상태 +
+    이번 라운드 제안"만으로 처음부터 계산해낸다 — 이것도 공유 상태를
+    갱신하는 게 아니라 매번 새 딕셔너리를 반환하므로 락이 필요 없다.
+    자세한 내용은 `_local_propose`, `_consensus_update` 참고.
 
     (참고: 이전 버전에서 이 부분에 "Local vs Global" 구분이 있었음 — 이
     구분은 정보 공개 여부에 대한 설계 선택이 바뀌면서 더 이상 필요 없음.
@@ -476,33 +488,42 @@ def compute_match_assignments(
                 continue
             valid_bidders[j].append(i)
 
-    current_winner: Dict[int, Tuple[int, float]] = {}
+    public_winner: Dict[int, Tuple[int, float]] = {}  # 매 라운드 broadcast되는 공개 winner table
     matched: Set[int] = set()
 
+    # v14 — 공유 가변 상태(락으로 보호해야 하는 딕셔너리) 자체를 없앴다.
+    # 매 라운드: (1) 아직 못 이긴 need들이 실제 OS 스레드에서 동시에
+    # _local_propose를 호출해 제안을 계산한다 — 이 계산은 읽기 전용이라
+    # 락이 필요 없다. (2) 모든 제안이 다 모이면(=broadcast), 순수 함수
+    # _consensus_update가 "이전 winner table + 이번 라운드 제안들"만
+    # 갖고 새 winner table을 처음부터 계산한다 — 이것도 공유 상태를
+    # 갱신하는 게 아니라 매번 새 딕셔너리를 만들어내는 거라 락이
+    # 필요 없다. 이전 버전(v13)은 "쓰기"에만 락을 걸었는데, 이번 버전은
+    # 애초에 쓰기가 필요한 공유 객체 자체가 없다.
     for _round in range(max_rounds):
-        # ── 경매 단계: 모든 미매칭 need가, 이번 라운드 시작 시점의 낙찰
-        #    현황만 보고, 서로 뭘 제안하는지 모른 채(동시에) 자기 제안을
-        #    계산한다 — 완전히 로컬인 연산 ─────────────────────────────────
-        proposals: Dict[int, Tuple[int, float]] = {}
-        for i in range(len(needs)):
-            if i in matched:
-                continue
-            proposal = _auction_phase(i, sim, valid_bidders, current_winner, needs)
-            if proposal is not None:
-                proposals[i] = proposal
+        pending = [i for i in range(len(needs)) if i not in matched]
+        if not pending:
+            break
+
+        # ── 경매 단계: 실제 스레드로 동시 실행, 순수 읽기 전용 계산 ──────────
+        snapshot = dict(public_winner)  # 이번 라운드에 broadcast되는 공개 정보
+        with ThreadPoolExecutor(max_workers=max(1, len(pending))) as ex:
+            futures = {i: ex.submit(_local_propose, i, sim, valid_bidders, snapshot, needs) for i in pending}
+            proposals = {i: f.result() for i, f in futures.items() if f.result() is not None}
 
         if not proposals:
             break
 
-        # ── 합의 단계: 이번 라운드에 모인 제안들을 공개된 결정론적 규칙으로
-        #    한꺼번에 반영 → 승자 확정 (중재자 없음, 규칙만 있음) ─────────────
-        changed = _consensus_phase(proposals, current_winner, matched, needs)
-        if not changed:
-            break
+        # ── 합의 단계: 순수 함수로 새 winner table 재계산 (락 불필요) ────────
+        new_winner = _consensus_update(public_winner, proposals, needs)
+        if new_winner == public_winner:
+            break  # 수렴 — 더 이상 아무도 낙찰 현황을 못 바꿈
+        public_winner = new_winner
+        matched = {i for i, _ in public_winner.values()}
 
     assignments: List[MatchAssignment] = []
     matched_need_ids: Set[str] = set()
-    for j, (i, score) in current_winner.items():
+    for j, (i, score) in public_winner.items():
         n = needs[i]
         tkind, tid, tagent, ttext, decl_sid = targets[j]
         assignments.append(MatchAssignment(
